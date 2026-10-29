@@ -16,13 +16,13 @@
 #include <mutex>
 #include <condition_variable>
 
-#include "web_streamer.hpp"
-
 #include <prepostprocessor.h>
+#include <bayer_letterbox.h>
 
 std::atomic<bool> g_running(true);
 std::atomic<uint64_t> g_packetDrops(0);
-std::atomic<double> g_currentCapFps(0.0);
+std::atomic<float> g_latestCapFps(0.0f);
+std::atomic<float> g_latestCapWorkMs(0.0f);
 using namespace nvinfer1;
 
 class Logger : public ILogger
@@ -40,8 +40,8 @@ struct LetterboxInfo {
     float scale;
     int padX;
     int padY;
-    int origWid = 1200;
-    int origHeig = 1920;
+    int origWid = 1920;
+    int origHeig = 1200;
 };
 
 // Synchronized packet containing images from all connected cameras
@@ -227,7 +227,6 @@ std::vector<float> imageProcessorPre(const cv::Mat& input, LetterboxInfo& info) 
 
 bool imagePreprocessorGPU(FrameBundle& bundle, uint8_t* basePtr, void* output, LetterboxInfo& info, cudaStream_t preProcess) {
     int numImages = bundle.images.size();
-    size_t sinImgSize = (info.origHeig * info.origWid * 3) * sizeof(uint8_t);
 
 
     const int targetSize = 640;
@@ -322,7 +321,6 @@ bool imagePreprocessorGPU_v2(FrameBundle& bundle, uint8_t* basePtr, void* output
 
 bool imagePreprocessorGPU_v3(FrameBundle& bundle, uint8_t* basePtr, void* output, LetterboxInfo& info, cudaStream_t preProcess) {
     int numImages = bundle.images.size();
-    size_t sinImgSize = (info.origHeig * info.origWid * 3) * sizeof(uint8_t);
 
 
     const int targetSize = 640;
@@ -361,6 +359,27 @@ bool imagePreprocessorGPU_v3(FrameBundle& bundle, uint8_t* basePtr, void* output
     cudaStreamSynchronize(preProcess); 
     return true;
 }
+
+bool imagePreprocessorGPU_v5(FrameBundle& bundle, int batchSize,
+                             uint8_t* rawPinned, uint8_t* rawDev, float* output,
+                             const BayerLetterboxParams& lp, cudaStream_t stream) {
+    const size_t one = static_cast<size_t>(lp.srcW) * lp.srcH;
+ 
+    if (static_cast<int>(bundle.images.size()) < batchSize) return false;
+ 
+    for (int i = 0; i < batchSize; ++i) {
+        const cv::Mat& img = bundle.images[i];
+        // guards against a camera resolution / pixel format change writing out of bounds
+        if (img.type() != CV_8UC1 || !img.isContinuous() || img.total() != one) return false;
+        std::memcpy(rawPinned + i * one, img.data, one);
+    }
+ 
+    cudaMemcpyAsync(rawDev, rawPinned, batchSize * one, cudaMemcpyHostToDevice, stream);
+    launchBayerLetterbox(rawDev, output, batchSize, lp, stream);
+ 
+    return cudaStreamSynchronize(stream) == cudaSuccess && cudaGetLastError() == cudaSuccess;
+}
+
 
 bool preProcessChecker(float* preProcessCPU, float* preProcessorGPU) {
     size_t dataSize = 640*640*3;
@@ -497,11 +516,13 @@ void captureWorker(int numCams,
         double cap_interval_ms = std::chrono::duration<double, std::milli>(t_cap_end - t_prev_capture).count();
         t_prev_capture = t_cap_end;
         double cap_fps = (frameCounter > 1 && cap_interval_ms > 0.0) ? (1000.0 / cap_interval_ms) : (1000.0 / cap_duration_ms);
-        g_currentCapFps.store(cap_fps);
 
         stats.totalFrames++;
         stats.sumWorkMs += cap_duration_ms;
         stats.endTime = t_cap_end;
+
+        g_latestCapFps.store(static_cast<float>(cap_fps));
+        g_latestCapWorkMs.store(static_cast<float>(cap_duration_ms));
 
         // Push the synchronized bundle into the thread-safe queue
         queue.push(std::move(bundle));
@@ -522,102 +543,165 @@ void captureWorker(int numCams,
 
 void inferenceWorker(int batchSize,
                      IExecutionContext* context,
-                     void* input,
-                     void* output,
+                     const char* inputName,
+                     const char* outputName,
+                     void* inputs[2],
+                     void* outputs[2],
                      cudaStream_t stream,
                      ThreadSafeQueue& queue,
                      InferenceStats& stats,
-                     MJPEGWebServer& webServer,
                      LetterboxInfo& info) {
     std::cout << "[Inference Worker] Started on thread: " << std::this_thread::get_id() << std::endl;
-    std::vector<LetterboxInfo> letterboxInfos(batchSize);
-
+ 
     int inferCount = 0;
     auto t_prev_infer = std::chrono::high_resolution_clock::now();
-    bool firstInfer = true;
-
-    int numImages = batchSize;
-    size_t sinImgSize = (info.origHeig * info.origWid * 3) * sizeof(uint8_t);
-
-    void* inputImages;
-    size_t inImgSize = numImages * 640 * 640 * 3 * sizeof(uint8_t);
-    cudaHostAlloc(&inputImages, inImgSize, cudaHostAllocMapped);
-
+ 
+    // Network input size (must match the engine and the tensors allocated in main)
+    constexpr int NET_W = 640, NET_H = 640;
+    const BayerLetterboxParams lp = makeBayerLetterboxParams(info.origWid, info.origHeig, NET_W, NET_H);
+ 
+    // Raw Bayer staging: CPU writes rawPinned -> H2D copy -> rawDev -> kernel reads rawDev.
+    // One pair is enough because imagePreprocessorGPU_v5 blocks until the kernel has finished.
+    const size_t rawBytes = static_cast<size_t>(batchSize) * lp.srcW * lp.srcH;
+    uint8_t* rawPinned = nullptr;
+    uint8_t* rawDev = nullptr;
+    if (cudaHostAlloc(reinterpret_cast<void**>(&rawPinned), rawBytes, cudaHostAllocDefault) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&rawDev), rawBytes) != cudaSuccess) {
+        std::cerr << "[Inference Worker] Failed to allocate raw Bayer staging buffers\n";
+        if (rawPinned) cudaFreeHost(rawPinned);
+        g_running = false;   // nothing can run without them; let the other threads wind down
+        return;
+    }
+ 
+    // High-priority stream so the ~1 ms preprocessing kernel is not stuck behind TensorRT kernels
+    int prioLeast = 0, prioGreatest = 0;
+    cudaDeviceGetStreamPriorityRange(&prioLeast, &prioGreatest);
     cudaStream_t preProcess;
-    cudaError_t err = cudaStreamCreate(&preProcess);  //I could have handled this error but I didn't.......Oh come one how likely is it that your cudaStream doesn't get created!!!!
-
-    uint8_t* basePtr = static_cast<uint8_t*>(inputImages);
-
+    cudaStreamCreateWithPriority(&preProcess, cudaStreamNonBlocking, prioGreatest);
+ 
+    int currentSlot = 0;
+    int nextSlot = 1;
+ 
+    // --- PIPELINE SEEDING (Batch 0) ---
+    FrameBundle currentBundle;
+    if (!queue.pop(currentBundle, g_running)) {
+        std::cout << "[Inference Worker] Exiting cleanly before starting...\n";
+        cudaStreamDestroy(preProcess);
+        cudaFreeHost(rawPinned);
+        cudaFree(rawDev);
+        return;
+    }
+ 
+    inferCount++;
+    auto t_work_start = std::chrono::high_resolution_clock::now();
+    stats.startTime = t_work_start;
+ 
+    // Preprocess Batch 0 into Slot 0
+    auto t_seed_pre_start = std::chrono::high_resolution_clock::now();
+    if (!imagePreprocessorGPU_v5(currentBundle, batchSize, rawPinned, rawDev,
+                                 static_cast<float*>(inputs[currentSlot]), lp, preProcess)) {
+        std::cout << "GPU preprocessing FAILED on seed batch!\n" << std::flush;
+    }
+    auto t_seed_pre_end = std::chrono::high_resolution_clock::now();
+    double last_pre_ms = std::chrono::duration<double, std::milli>(t_seed_pre_end - t_seed_pre_start).count();
+ 
+    // Launch TensorRT on Batch 0 asynchronously
+    auto t_trt_start = std::chrono::high_resolution_clock::now();
+    context->setTensorAddress(inputName, inputs[currentSlot]);
+    context->setTensorAddress(outputName, outputs[currentSlot]);
+    context->enqueueV3(stream);
+ 
+    // --- STEADY-STATE DOUBLE-BUFFERED PIPELINE LOOP ---
     while (g_running) {
-        FrameBundle bundle;
-
-        // 1. Wait on condition variable (0% CPU until a frame arrives)
-        if (!queue.pop(bundle, g_running)) {
+        FrameBundle nextBundle;
+        // 1. Pop next bundle from queue
+        if (!queue.pop(nextBundle, g_running)) {
             break; // Ctrl+C signaled shutdown
         }
-
-        inferCount++;
-        auto t_work_start = std::chrono::high_resolution_clock::now();
-        if (firstInfer) {
-            stats.startTime = t_work_start;
-            firstInfer = false;
-        }
-
+ 
+        // 2. OVERLAP: While GPU is busy inferring currentSlot on `stream`,
+        //             the preProcess stream builds the tensor for nextBundle into nextSlot!
         auto t_pre_start = std::chrono::high_resolution_clock::now();
-        if (!imagePreprocessorGPU_v2(bundle, basePtr, input, info, preProcess)) {
-            std::cout << "GPU preprocessing FAILED!!!\n" << std::flush;
+        if (!imagePreprocessorGPU_v5(nextBundle, batchSize, rawPinned, rawDev,
+                                     static_cast<float*>(inputs[nextSlot]), lp, preProcess)) {
+            std::cout << "GPU preprocessing FAILED on batch " << nextBundle.frameId << "!\n" << std::flush;
         }
-
-        // 2. Preprocessing (Debayer + Letterbox each camera image in the batch)
-        std::vector<cv::Mat> bgrList = bundle.images;
-        
         auto t_pre_end = std::chrono::high_resolution_clock::now();
         double pre_ms = std::chrono::duration<double, std::milli>(t_pre_end - t_pre_start).count();
-
-        // 3. Batched TensorRT Forward Pass
-        auto t_trt_start = std::chrono::high_resolution_clock::now();
-        context->enqueueV3(stream);
+ 
+        // 3. Wait for currentSlot's TensorRT inference to finish on `stream`
         cudaStreamSynchronize(stream);
         auto t_trt_end = std::chrono::high_resolution_clock::now();
         double trt_ms = std::chrono::duration<double, std::milli>(t_trt_end - t_trt_start).count();
-
-        auto t_work_end = std::chrono::high_resolution_clock::now();
+ 
+        auto t_work_end = t_trt_end;
         double total_work_ms = std::chrono::duration<double, std::milli>(t_work_end - t_work_start).count();
         double infer_interval_ms = std::chrono::duration<double, std::milli>(t_work_end - t_prev_infer).count();
         t_prev_infer = t_work_end;
         double infer_fps = (inferCount > 1 && infer_interval_ms > 0.0) ? (1000.0 / infer_interval_ms) : (1000.0 / total_work_ms);
-
+ 
+        // 4. IMMEDIATELY launch TensorRT on the nextSlot (already preprocessed in background!)
+        //    This keeps the GPU 100% saturated with ZERO idle wait time.
+        inferCount++;
+        t_work_start = std::chrono::high_resolution_clock::now();
+        t_trt_start = t_work_start;
+ 
+        context->setTensorAddress(inputName, inputs[nextSlot]);
+        context->setTensorAddress(outputName, outputs[nextSlot]);
+        context->enqueueV3(stream);
+ 
         stats.totalFrames++;
-        stats.sumPreMs += pre_ms;
+        stats.sumPreMs += last_pre_ms;
         stats.sumTrtMs += trt_ms;
         stats.sumTotalMs += total_work_ms;
         stats.endTime = t_work_end;
-
-        // Publish debayered frame & real-time telemetry to the MJPEG Web Monitor
-        WebStats ws;
-        ws.frameId = bundle.frameId;
-        ws.capFps = g_currentCapFps.load();
-        ws.infFps = infer_fps;
-        ws.capWorkMs = 0.0;
-        ws.trtMs = trt_ms;
-        ws.packetDrops = g_packetDrops.load();
-        ws.numCams = batchSize;
-        webServer.updateFrame(bgrList, ws);
-
+ 
         {
             std::lock_guard<std::mutex> lock(g_coutMutex);
-            std::cout << "[INFERENCE] Frame " << bundle.frameId
-                      << " | Pre: " << pre_ms << " ms"
+            std::cout << "[INFERENCE] Frame " << currentBundle.frameId
+                      << " | Pre: " << last_pre_ms << " ms"
                       << " | TRT: " << trt_ms << " ms"
                       << " | Total: " << total_work_ms << " ms"
                       << " | Rate: " << infer_fps << " FPS"
                       << std::endl;
         }
+ 
+        // 7. Ping-pong swap slots and hand over bundle
+        last_pre_ms = pre_ms;
+        currentBundle = std::move(nextBundle);
+        std::swap(currentSlot, nextSlot);
     }
+ 
+    // Drain the final launched batch
+    cudaStreamSynchronize(stream);
+    auto t_drain_end = std::chrono::high_resolution_clock::now();
+    double final_trt_ms = std::chrono::duration<double, std::milli>(t_drain_end - t_trt_start).count();
+    double final_total_ms = std::chrono::duration<double, std::milli>(t_drain_end - t_work_start).count();
+    double final_interval_ms = std::chrono::duration<double, std::milli>(t_drain_end - t_prev_infer).count();
+    double final_fps = (inferCount > 1 && final_interval_ms > 0.0) ? (1000.0 / final_interval_ms) : (1000.0 / final_total_ms);
+ 
+    stats.totalFrames++;
+    stats.sumPreMs += last_pre_ms;
+    stats.sumTrtMs += final_trt_ms;
+    stats.sumTotalMs += final_total_ms;
+    stats.endTime = t_drain_end;
+ 
+    {
+        std::lock_guard<std::mutex> lock(g_coutMutex);
+        std::cout << "[INFERENCE] Frame " << currentBundle.frameId
+                  << " | Pre: " << last_pre_ms << " ms"
+                  << " | TRT: " << final_trt_ms << " ms"
+                  << " | Total: " << final_total_ms << " ms"
+                  << " | Rate: " << final_fps << " FPS"
+                  << std::endl;
+    }
+ 
     std::cout << "[Inference Worker] Exiting cleanly...\n";
     cudaStreamDestroy(preProcess);
-    cudaFree(inputImages); 
+    cudaFreeHost(rawPinned);
+    cudaFree(rawDev);
 }
+
 
 
 int main() {
@@ -698,17 +782,19 @@ int main() {
         }
         std::cout << "] (Total elements: " << outputCount << ")\n";
 
-        // Allocate host-pinned memory scaled for the dynamic batch size
-        void* input = nullptr;
-        void* output = nullptr;
+        // Allocate double-buffered host-pinned memory scaled for the dynamic batch size
+        void* inputs[2] = {nullptr, nullptr};
+        void* outputs[2] = {nullptr, nullptr};
         size_t inputSize = static_cast<size_t>(batchSize) * 3 * 640 * 640 * sizeof(float);
         size_t outputSize = outputCount * sizeof(float);
 
-        cudaHostAlloc(&input,  inputSize,  cudaHostAllocMapped);
-        cudaHostAlloc(&output, outputSize, cudaHostAllocMapped);
+        for (int i = 0; i < 2; i++) {
+            cudaHostAlloc(&inputs[i],  inputSize,  cudaHostAllocMapped);
+            cudaHostAlloc(&outputs[i], outputSize, cudaHostAllocMapped);
+        }
 
-        context->setTensorAddress(inputName, input);
-        context->setTensorAddress(outputName, output);
+        context->setTensorAddress(inputName, inputs[0]);
+        context->setTensorAddress(outputName, outputs[0]);
 
         cudaStream_t stream;
         cudaStreamCreate(&stream);
@@ -730,7 +816,7 @@ int main() {
             Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "ExposureAuto", "Off");
             Arena::SetNodeValue<double>(arNodeMap[i], "ExposureTime", 20000.0);
             Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "GainAuto", "Off");
-            Arena::SetNodeValue<double>(arNodeMap[i], "Gain", 1.0);
+            Arena::SetNodeValue<double>(arNodeMap[i], "Gain", 10.0);
 
             //Trigger configuration
             Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "TriggerSelector", "FrameStart");
@@ -809,11 +895,7 @@ int main() {
         CaptureStats capStats;
         InferenceStats infStats;
 
-        MJPEGWebServer webServer(8080);
-        webServer.start();
-
-        std::cout << "\n[PIPELINE] Launching Trigger (20Hz), Capture, and Inference threads. Press Ctrl+C to stop...\n";
-        std::cout << "[WEB MONITOR] Open http://<Jetson-IP>:8080 in your browser to view live streams.\n\n";
+        std::cout << "\n[PIPELINE] Launching Trigger (20Hz), Capture, and Inference threads. Press Ctrl+C to stop...\n\n";
 
         // Dedicated high-precision 20.0 Hz PTP Action Command generator
         std::thread triggerThread(triggerWorker, 
@@ -830,19 +912,20 @@ int main() {
         std::thread inferenceThread(inferenceWorker, 
                                   batchSize, 
                                   context, 
-                                  input, 
-                                  output, 
+                                  inputName,
+                                  outputName,
+                                  inputs, 
+                                  outputs, 
                                   stream, 
                                   std::ref(frameQueue),
                                   std::ref(infStats),
-                                  std::ref(webServer),
                                   std::ref(info));
 
         cameraThread.join();
         triggerThread.join();
         inferenceThread.join();
-        webServer.stop();
         g_queuePtr = nullptr;
+
         std::cout << "\n[PIPELINE] Both threads terminated. Releasing resources...\n";
 
         // Print final performance averages across entire run
@@ -899,8 +982,10 @@ int main() {
 
         // Clean up CUDA stream and pinned host memory
         cudaStreamDestroy(stream);
-        cudaFreeHost(input);
-        cudaFreeHost(output);
+        for (int i = 0; i < 2; i++) {
+            cudaFreeHost(inputs[i]);
+            cudaFreeHost(outputs[i]);
+        }
 
         delete context;
         delete engine;
