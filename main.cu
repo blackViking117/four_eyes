@@ -19,6 +19,17 @@
 #include <prepostprocessor.h>
 #include <bayer_letterbox.h>
 
+// ==============================================================================
+// MODULAR WEB SERVER CONFIGURATION
+// Set to 1 to enable the live MJPEG web monitor on port 8080 (http://0.0.0.0:8080)
+// Set to 0 to completely disable and compile out the web server
+// ==============================================================================
+#define ENABLE_WEB_SERVER 1
+
+#if ENABLE_WEB_SERVER
+#include <web_streamer.hpp>
+#endif
+
 std::atomic<bool> g_running(true);
 std::atomic<uint64_t> g_packetDrops(0);
 std::atomic<float> g_latestCapFps(0.0f);
@@ -35,6 +46,8 @@ class Logger : public ILogger
         }
     }
 } logger;
+
+const std::set<std::string> kRotate180Serials = {"251400510", "251102016"};
 
 struct LetterboxInfo {
     float scale;
@@ -66,6 +79,21 @@ struct InferenceStats {
     double sumTotalMs = 0.0;
     std::chrono::high_resolution_clock::time_point startTime;
     std::chrono::high_resolution_clock::time_point endTime;
+};
+
+
+static const std::array<std::string, 80> kClassNames = {
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+    "toothbrush"
 };
 
 class ThreadSafeQueue {
@@ -380,6 +408,68 @@ bool imagePreprocessorGPU_v5(FrameBundle& bundle, int batchSize,
     return cudaStreamSynchronize(stream) == cudaSuccess && cudaGetLastError() == cudaSuccess;
 }
 
+std::vector<cv::Mat> drawDetections(const float* output,
+                                    int batchSize,
+                                    const std::vector<cv::Mat>& bayerImages,
+                                    const LetterboxInfo& info,
+                                    int numDets = 300,
+                                    float confThresh = 0.45f)
+{
+    const int stride = 6;  // x1, y1, x2, y2, score, class
+    const int n = std::min<int>(batchSize, static_cast<int>(bayerImages.size()));
+    std::vector<cv::Mat> drawn(n);
+
+    for (int b = 0; b < n; ++b) {
+        cv::cvtColor(bayerImages[b], drawn[b], cv::COLOR_BayerBG2BGR);
+
+        const float* det = output + static_cast<size_t>(b) * numDets * stride;
+
+        for (int d = 0; d < numDets; ++d, det += stride) {
+            const float score = det[4];
+            if (score < confThresh) continue;
+
+            // Undo letterbox: remove padding, then undo scale
+            float x1 = (det[0] - info.padX) / info.scale;
+            float y1 = (det[1] - info.padY) / info.scale;
+            float x2 = (det[2] - info.padX) / info.scale;
+            float y2 = (det[3] - info.padY) / info.scale;
+
+            // Clamp to the original image
+            x1 = std::max(0.0f, std::min(x1, static_cast<float>(info.origWid  - 1)));
+            x2 = std::max(0.0f, std::min(x2, static_cast<float>(info.origWid  - 1)));
+            y1 = std::max(0.0f, std::min(y1, static_cast<float>(info.origHeig - 1)));
+            y2 = std::max(0.0f, std::min(y2, static_cast<float>(info.origHeig - 1)));
+
+            cv::Point p1(static_cast<int>(x1), static_cast<int>(y1));
+            cv::Point p2(static_cast<int>(x2), static_cast<int>(y2));
+            const cv::Scalar color(0, 255, 0);
+            cv::rectangle(drawn[b], p1, p2, color, 3);
+
+            // Class id -> name (falls back to the number if it's out of range)
+            const int cls = static_cast<int>(det[5]);
+            std::string name = (cls >= 0 && cls < static_cast<int>(kClassNames.size()))
+                                   ? kClassNames[cls]
+                                   : std::to_string(cls);
+
+            char score_str[16];
+            std::snprintf(score_str, sizeof(score_str), " %.2f", score);
+            const std::string label = name + score_str;
+
+            // Filled background behind the text so longer names stay readable
+            int baseline = 0;
+            const cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseline);
+            const int ty = std::max(p1.y, ts.height + 6);  // keep label inside the image
+            cv::rectangle(drawn[b],
+                          cv::Point(p1.x, ty - ts.height - 6),
+                          cv::Point(p1.x + ts.width, ty + baseline - 4),
+                          color, cv::FILLED);
+            cv::putText(drawn[b], label, cv::Point(p1.x, ty - 6),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 2);
+        }
+    }
+    return drawn;
+}
+
 
 bool preProcessChecker(float* preProcessCPU, float* preProcessorGPU) {
     size_t dataSize = 640*640*3;
@@ -550,7 +640,11 @@ void inferenceWorker(int batchSize,
                      cudaStream_t stream,
                      ThreadSafeQueue& queue,
                      InferenceStats& stats,
-                     LetterboxInfo& info) {
+                     LetterboxInfo& info
+#if ENABLE_WEB_SERVER
+                     , MJPEGWebServer* webServer = nullptr
+#endif
+) {
     std::cout << "[Inference Worker] Started on thread: " << std::this_thread::get_id() << std::endl;
  
     int inferCount = 0;
@@ -572,6 +666,7 @@ void inferenceWorker(int batchSize,
         g_running = false;   // nothing can run without them; let the other threads wind down
         return;
     }
+
  
     // High-priority stream so the ~1 ms preprocessing kernel is not stuck behind TensorRT kernels
     int prioLeast = 0, prioGreatest = 0;
@@ -602,6 +697,7 @@ void inferenceWorker(int batchSize,
                                  static_cast<float*>(inputs[currentSlot]), lp, preProcess)) {
         std::cout << "GPU preprocessing FAILED on seed batch!\n" << std::flush;
     }
+
     auto t_seed_pre_end = std::chrono::high_resolution_clock::now();
     double last_pre_ms = std::chrono::duration<double, std::milli>(t_seed_pre_end - t_seed_pre_start).count();
  
@@ -649,12 +745,28 @@ void inferenceWorker(int batchSize,
         context->setTensorAddress(inputName, inputs[nextSlot]);
         context->setTensorAddress(outputName, outputs[nextSlot]);
         context->enqueueV3(stream);
- 
+
         stats.totalFrames++;
         stats.sumPreMs += last_pre_ms;
         stats.sumTrtMs += trt_ms;
         stats.sumTotalMs += total_work_ms;
         stats.endTime = t_work_end;
+
+        std::vector<cv::Mat> results = drawDetections(static_cast<float*>(outputs[currentSlot]), batchSize, currentBundle.images, info);
+
+#if ENABLE_WEB_SERVER
+        if (webServer) {
+            WebStats wStats;
+            wStats.frameId = currentBundle.frameId;
+            wStats.capFps = g_latestCapFps.load();
+            wStats.infFps = infer_fps;
+            wStats.capWorkMs = g_latestCapWorkMs.load();
+            wStats.trtMs = trt_ms;
+            wStats.packetDrops = g_packetDrops.load();
+            wStats.numCams = batchSize;
+            webServer->updateFrames(currentBundle.images, results, wStats);
+        }
+#endif
  
         {
             std::lock_guard<std::mutex> lock(g_coutMutex);
@@ -685,6 +797,22 @@ void inferenceWorker(int batchSize,
     stats.sumTrtMs += final_trt_ms;
     stats.sumTotalMs += final_total_ms;
     stats.endTime = t_drain_end;
+
+    std::vector<cv::Mat> finalResults = drawDetections(static_cast<float*>(outputs[currentSlot]), batchSize, currentBundle.images, info);
+
+#if ENABLE_WEB_SERVER
+    if (webServer) {
+        WebStats wStats;
+        wStats.frameId = currentBundle.frameId;
+        wStats.capFps = g_latestCapFps.load();
+        wStats.infFps = final_fps;
+        wStats.capWorkMs = g_latestCapWorkMs.load();
+        wStats.trtMs = final_trt_ms;
+        wStats.packetDrops = g_packetDrops.load();
+        wStats.numCams = batchSize;
+        webServer->updateFrames(currentBundle.images, finalResults, wStats);
+    }
+#endif
  
     {
         std::lock_guard<std::mutex> lock(g_coutMutex);
@@ -705,7 +833,7 @@ void inferenceWorker(int batchSize,
 
 
 int main() {
-    std::string engineFilePath = "/media/swdep/500GB_SSD_PERCEP/black_magic/yolov10x_dynamic_fp32.engine";
+    std::string engineFilePath = "/media/swdep/500GB_SSD_PERCEP/black_magic/yolov10x_dynamic_4_fp16.engine";
 
     std::ifstream engineFile(engineFilePath, std::ios::binary | std::ios::ate);
     if (!engineFile) {
@@ -810,7 +938,24 @@ int main() {
             //configuring each camera
 
             //pixel formatting
+            const std::string serial = cameras[i].SerialNumber().c_str();
+            const bool rotate180 = kRotate180Serials.count(serial) > 0;
+
+            // 1. Clear any flip left over from a previous run
+            Arena::SetNodeValue<bool>(arNodeMap[i], "ReverseX", false);
+            Arena::SetNodeValue<bool>(arNodeMap[i], "ReverseY", false);
+
+            // 2. With no flip active, BayerRG8 is writable
             Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "PixelFormat", "BayerRG8");
+
+            // 3. Apply the flip; the camera updates PixelFormat itself
+            Arena::SetNodeValue<bool>(arNodeMap[i], "ReverseX", rotate180);
+            Arena::SetNodeValue<bool>(arNodeMap[i], "ReverseY", rotate180);
+
+            GenICam::gcstring pf = Arena::GetNodeValue<GenICam::gcstring>(arNodeMap[i], "PixelFormat");
+            std::cout << "  Camera [" << i << "] " << serial
+                    << " | rotate180=" << rotate180
+                    << " | PixelFormat=" << pf << "\n";
 
             //exposure set to equal time for each camera
             Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "ExposureAuto", "Off");
@@ -895,6 +1040,13 @@ int main() {
         CaptureStats capStats;
         InferenceStats infStats;
 
+#if ENABLE_WEB_SERVER
+        MJPEGWebServer webServer(8080);
+        if (!webServer.start()) {
+            std::cerr << "[WARN] Failed to start Web Server on port 8080\n";
+        }
+#endif
+
         std::cout << "\n[PIPELINE] Launching Trigger (20Hz), Capture, and Inference threads. Press Ctrl+C to stop...\n\n";
 
         // Dedicated high-precision 20.0 Hz PTP Action Command generator
@@ -919,12 +1071,20 @@ int main() {
                                   stream, 
                                   std::ref(frameQueue),
                                   std::ref(infStats),
-                                  std::ref(info));
+                                  std::ref(info)
+#if ENABLE_WEB_SERVER
+                                  , &webServer
+#endif
+        );
 
         cameraThread.join();
         triggerThread.join();
         inferenceThread.join();
         g_queuePtr = nullptr;
+
+#if ENABLE_WEB_SERVER
+        webServer.stop();
+#endif
 
         std::cout << "\n[PIPELINE] Both threads terminated. Releasing resources...\n";
 

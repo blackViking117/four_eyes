@@ -30,6 +30,13 @@ struct WebStats {
     int numCams = 0;
 };
 
+struct CameraDetail {
+    int index = 0;
+    std::string serial;
+    std::string model;
+    std::string ip;
+};
+
 class MJPEGWebServer {
 private:
     int m_port;
@@ -38,8 +45,12 @@ private:
     std::thread m_serverThread;
 
     std::mutex m_frameMutex;
-    std::vector<cv::Mat> m_latestImages;
+    std::vector<cv::Mat> m_latestPostImages;
+    std::vector<cv::Mat> m_latestPreImages;
     WebStats m_latestStats;
+
+    std::mutex m_cameraMutex;
+    std::vector<CameraDetail> m_cameraDetails;
 
     static bool sendAll(int clientFd, const char* data, size_t length) {
         size_t totalSent = 0;
@@ -57,8 +68,27 @@ private:
         return sendAll(clientFd, str.c_str(), str.length());
     }
 
+    // Helper to ensure an image is 3-channel BGR for display/grid composition
+    static cv::Mat ensureBGR(const cv::Mat& src) {
+        if (src.empty()) return cv::Mat();
+        if (src.channels() == 3) {
+            return src;
+        }
+        cv::Mat bgr;
+        if (src.channels() == 1) {
+            try {
+                // If BayerRG8 (OpenCV calls BayerRG8 pattern "BG")
+                cv::cvtColor(src, bgr, cv::COLOR_BayerBG2BGR);
+            } catch (...) {
+                cv::cvtColor(src, bgr, cv::COLOR_GRAY2BGR);
+            }
+            return bgr;
+        }
+        return src;
+    }
+
     // Dynamic grid layout builder for 1 to 8 cameras
-    static cv::Mat composeGrid(const std::vector<cv::Mat>& images, int frameId, uint64_t drops) {
+    static cv::Mat composeGrid(const std::vector<cv::Mat>& images, int frameId, uint64_t drops, const std::string& prefix = "CAM ") {
         if (images.empty()) return cv::Mat();
 
         int n = static_cast<int>(images.size());
@@ -68,21 +98,24 @@ private:
 
         // 1 Camera
         if (n == 1) {
+            cv::Mat bgr = ensureBGR(images[0]);
             cv::Mat out;
-            cv::resize(images[0], out, cv::Size(960, 600));
-            std::string label = "CAM 0 | #" + std::to_string(frameId) + " | Drops: " + std::to_string(drops);
+            cv::resize(bgr, out, cv::Size(960, 600));
+            std::string label = prefix + "0 | #" + std::to_string(frameId) + " | Drops: " + std::to_string(drops);
             cv::putText(out, label, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, tagCol, 2);
             return out;
         }
 
         // 2 Cameras: 1 Row x 2 Columns (1280 x 400)
         if (n == 2) {
+            cv::Mat bgr0 = ensureBGR(images[0]);
+            cv::Mat bgr1 = ensureBGR(images[1]);
             cv::Mat r0, r1, out;
-            cv::resize(images[0], r0, cv::Size(640, 400));
-            cv::resize(images[1], r1, cv::Size(640, 400));
+            cv::resize(bgr0, r0, cv::Size(640, 400));
+            cv::resize(bgr1, r1, cv::Size(640, 400));
 
-            cv::putText(r0, "CAM 0 | #" + std::to_string(frameId), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, tagCol, 2);
-            cv::putText(r1, "CAM 1 | #" + std::to_string(frameId), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, tagCol, 2);
+            cv::putText(r0, prefix + "0 | #" + std::to_string(frameId), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, tagCol, 2);
+            cv::putText(r1, prefix + "1 | #" + std::to_string(frameId), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, tagCol, 2);
 
             cv::hconcat(r0, r1, out);
             return out;
@@ -98,12 +131,13 @@ private:
         std::vector<cv::Mat> tiles(rows * cols);
         for (int i = 0; i < rows * cols; i++) {
             if (i < n && !images[i].empty()) {
-                cv::resize(images[i], tiles[i], cv::Size(tileW, tileH));
-                std::string label = "CAM " + std::to_string(i) + " | #" + std::to_string(frameId);
+                cv::Mat bgr = ensureBGR(images[i]);
+                cv::resize(bgr, tiles[i], cv::Size(tileW, tileH));
+                std::string label = prefix + std::to_string(i) + " | #" + std::to_string(frameId);
                 cv::putText(tiles[i], label, cv::Point(15, 28), cv::FONT_HERSHEY_SIMPLEX, 0.65, tagCol, 2);
             } else {
                 tiles[i] = cv::Mat::zeros(cv::Size(tileW, tileH), CV_8UC3);
-                std::string emptyLabel = (i < 8) ? "CAM " + std::to_string(i) + " (OFF)" : "EMPTY";
+                std::string emptyLabel = (i < 8) ? prefix + std::to_string(i) + " (OFF)" : "EMPTY";
                 cv::putText(tiles[i], emptyLabel, cv::Point(tileW / 4, tileH / 2),
                             cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(100, 100, 100), 2);
             }
@@ -123,6 +157,23 @@ private:
         return gridOut;
     }
 
+    static cv::Mat composeCombined(const std::vector<cv::Mat>& preImages,
+                                   const std::vector<cv::Mat>& postImages,
+                                   int frameId, uint64_t drops) {
+        cv::Mat preGrid = composeGrid(preImages, frameId, drops, "PRE CAM ");
+        cv::Mat postGrid = composeGrid(postImages, frameId, drops, "DET CAM ");
+        if (preGrid.empty()) return postGrid;
+        if (postGrid.empty()) return preGrid;
+
+        if (preGrid.cols != postGrid.cols) {
+            cv::resize(preGrid, preGrid, cv::Size(postGrid.cols, preGrid.rows));
+        }
+
+        cv::Mat out;
+        cv::vconcat(preGrid, postGrid, out);
+        return out;
+    }
+
     void serveIndexHtml(int clientFd) {
         std::string html = 
 R"rawhtml(<!DOCTYPE html>
@@ -134,7 +185,7 @@ R"rawhtml(<!DOCTYPE html>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f19; color: #f1f5f9; padding: 24px; }
-        .container { max-width: 1440px; margin: 0 auto; }
+        .container { max-width: 1600px; margin: 0 auto; }
         header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid #1e293b; padding-bottom: 16px; }
         h1 { font-size: 22px; font-weight: 700; color: #38bdf8; display: flex; align-items: center; gap: 12px; }
         .pill { background: #10b981; color: #042f2e; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 9999px; letter-spacing: 0.5px; }
@@ -144,12 +195,39 @@ R"rawhtml(<!DOCTYPE html>
         .stat-val { font-size: 24px; font-weight: 700; color: #f8fafc; }
         .val-ok { color: #34d399; }
         .val-warn { color: #f87171; }
+        .view-controls { display: flex; gap: 10px; margin-bottom: 16px; }
+        .btn { background: #1e293b; border: 1px solid #334155; color: #94a3b8; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s ease; }
+        .btn:hover { background: #334155; color: #f8fafc; }
+        .btn.active { background: #0284c7; color: #ffffff; border-color: #38bdf8; }
+        .streams-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(640px, 1fr)); gap: 20px; margin-bottom: 20px; }
         .stream-card { background: #020617; border: 1px solid #1e293b; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); }
         .stream-header { padding: 10px 18px; background: #0f172a; font-size: 13px; font-weight: 600; color: #94a3b8; display: flex; justify-content: space-between; align-items: center; }
-        .stream-img { width: 100%; height: auto; display: block; background: #000; min-height: 400px; object-fit: contain; }
-        .nav-links { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: #64748b; align-items: center; }
+        .badge { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 6px; letter-spacing: 0.5px; }
+        .badge-purple { background: #4c1d95; color: #c4b5fd; }
+        .badge-green { background: #064e3b; color: #6ee7b7; }
+        .stream-img { width: 100%; height: auto; display: block; background: #000; min-height: 380px; object-fit: contain; }
+        .nav-links { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: #64748b; align-items: center; }
         a { color: #38bdf8; text-decoration: none; font-weight: 500; }
         a:hover { text-decoration: underline; }
+
+        /* Camera Details & Copyable Serials Panel */
+        .cam-panel { background: #131d31; border: 1px solid #1e293b; border-radius: 10px; padding: 14px 18px; margin-bottom: 20px; }
+        .cam-panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 10px; }
+        .cam-panel-title { font-size: 12px; font-weight: 700; color: #38bdf8; text-transform: uppercase; letter-spacing: 0.6px; display: flex; align-items: center; gap: 8px; }
+        .cam-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+        .cam-item { background: #0b1120; border: 1px solid #1e293b; border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+        .cam-item-top { display: flex; justify-content: space-between; align-items: center; }
+        .cam-id-badge { background: #0284c7; color: #fff; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 4px; }
+        .cam-model { font-size: 12px; color: #94a3b8; font-weight: 500; }
+        .cam-serial-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .cam-serial-code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 14px; font-weight: 700; color: #34d399; background: #020617; padding: 6px 10px; border-radius: 6px; border: 1px solid #1e293b; letter-spacing: 0.8px; flex-grow: 1; user-select: all; cursor: pointer; }
+        .cam-serial-code:hover { border-color: #38bdf8; background: #091224; }
+        .btn-copy { background: #1e293b; border: 1px solid #334155; color: #cbd5e1; padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s ease; white-space: nowrap; }
+        .btn-copy:hover { background: #38bdf8; color: #0f172a; border-color: #38bdf8; }
+        .btn-copy.copied { background: #10b981; color: #042f2e; border-color: #34d399; }
+        .btn-action { background: #1e293b; border: 1px solid #334155; color: #cbd5e1; padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s ease; }
+        .btn-action:hover { background: #0284c7; color: #fff; border-color: #38bdf8; }
+        .btn-action.copied { background: #10b981; color: #042f2e; border-color: #34d399; }
     </style>
 </head>
 <body>
@@ -185,18 +263,60 @@ R"rawhtml(<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="stream-card">
-            <div class="stream-header">
-                <span id="stream-title">Synchronized Multi-Camera Grid</span>
-                <span style="font-size: 12px; color: #38bdf8;">BayerRG8 &rarr; BGR &rarr; Dynamic Grid MJPEG</span>
+        <!-- Camera Hardware & Serial Numbers Panel -->
+        <div class="cam-panel" id="cam-panel">
+            <div class="cam-panel-header">
+                <div class="cam-panel-title">
+                    <span>Connected Cameras &amp; Serial Numbers</span>
+                    <span style="font-size: 11px; color: #64748b; font-weight: 400; text-transform: none;">(Click any serial number or button to copy)</span>
+                </div>
+                <div style="display: flex; gap: 8px;">
+                    <button class="btn-action" id="btn-copy-all" onclick="copyAllSerials()">Copy All Serials</button>
+                    <button class="btn-action" id="btn-copy-json" onclick="copySerialsJson()">Copy JSON Map</button>
+                </div>
             </div>
-            <img class="stream-img" src="/stream" alt="Live Camera Video Stream" />
+            <div class="cam-grid" id="cam-grid-container">
+                <div style="color: #64748b; font-size: 13px; padding: 8px;">Discovering camera hardware serial numbers...</div>
+            </div>
+        </div>
+
+        <div class="view-controls">
+            <button class="btn active" id="btn-dual" onclick="setView('dual')">Dual View (Pre + Post)</button>
+            <button class="btn" id="btn-post" onclick="setView('post')">Detection Results Only</button>
+            <button class="btn" id="btn-pre" onclick="setView('pre')">Pre-Inference (Camera) Only</button>
+        </div>
+
+        <div class="streams-container" id="streams-grid">
+            <div class="stream-card" id="card-pre">
+                <div class="stream-header">
+                    <span id="title-pre">Pre-Inference Camera Feed</span>
+                    <span class="badge badge-purple">PRE-INFERENCE (CAMERA)</span>
+                </div>
+                <img class="stream-img" src="/pre_stream" alt="Pre-Inference Camera Stream" />
+            </div>
+
+            <div class="stream-card" id="card-post">
+                <div class="stream-header">
+                    <span id="title-post">Post-Inference Detection Results</span>
+                    <span class="badge badge-green">YOLOv10 DETECTIONS</span>
+                </div>
+                <img class="stream-img" src="/stream" alt="Detection Results Stream" />
+            </div>
         </div>
 
         <div class="nav-links">
-            <span id="direct-links">Direct Feeds: <a href="/stream" target="_blank">All Grid</a></span>
+            <span>Direct Feeds:</span>
+            <span><a href="/stream" target="_blank">Detections Grid</a></span>
             <span>&bull;</span>
-            <span><a href="/snapshot" target="_blank">Full Grid Snapshot</a></span>
+            <span><a href="/pre_stream" target="_blank">Pre-Inference Grid</a></span>
+            <span>&bull;</span>
+            <span><a href="/combined_stream" target="_blank">Combined Dual Grid</a></span>
+            <span>&bull;</span>
+            <span id="direct-links"></span>
+            <span>&bull;</span>
+            <span><a href="/snapshot" target="_blank">Snapshot (Detections)</a></span>
+            <span>&bull;</span>
+            <span><a href="/pre_snapshot" target="_blank">Snapshot (Pre-Inf)</a></span>
             <span>&bull;</span>
             <span><a href="/stats" target="_blank">Raw Stats JSON</a></span>
         </div>
@@ -204,6 +324,77 @@ R"rawhtml(<!DOCTYPE html>
 
     <script>
         let lastNumCams = -1;
+        let currentCameras = [];
+
+        function copyText(text, btn) {
+            function showSuccess() {
+                if (!btn) return;
+                const orig = btn.innerText;
+                btn.innerText = 'Copied!';
+                btn.classList.add('copied');
+                setTimeout(() => {
+                    btn.innerText = orig;
+                    btn.classList.remove('copied');
+                }, 1500);
+            }
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(showSuccess).catch(() => fallbackCopy(text, showSuccess));
+            } else {
+                fallbackCopy(text, showSuccess);
+            }
+        }
+
+        function fallbackCopy(text, cb) {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            try { document.execCommand('copy'); if (cb) cb(); } catch (e) {}
+            document.body.removeChild(ta);
+        }
+
+        function copyAllSerials() {
+            if (!currentCameras.length) return;
+            const txt = currentCameras.map(c => `CAM ${c.index}: ${c.serial} (${c.model || 'TRI023S-C'})`).join('\n');
+            copyText(txt, document.getElementById('btn-copy-all'));
+        }
+
+        function copySerialsJson() {
+            if (!currentCameras.length) return;
+            const obj = {};
+            currentCameras.forEach(c => { obj[`CAM_${c.index}`] = c.serial; });
+            copyText(JSON.stringify(obj, null, 2), document.getElementById('btn-copy-json'));
+        }
+
+        function setView(view) {
+            const cardPre = document.getElementById('card-pre');
+            const cardPost = document.getElementById('card-post');
+            const grid = document.getElementById('streams-grid');
+            const btnDual = document.getElementById('btn-dual');
+            const btnPost = document.getElementById('btn-post');
+            const btnPre = document.getElementById('btn-pre');
+
+            btnDual.className = 'btn' + (view === 'dual' ? ' active' : '');
+            btnPost.className = 'btn' + (view === 'post' ? ' active' : '');
+            btnPre.className = 'btn' + (view === 'pre' ? ' active' : '');
+
+            if (view === 'dual') {
+                cardPre.style.display = 'block';
+                cardPost.style.display = 'block';
+                grid.style.gridTemplateColumns = 'repeat(auto-fit, minmax(640px, 1fr))';
+            } else if (view === 'post') {
+                cardPre.style.display = 'none';
+                cardPost.style.display = 'block';
+                grid.style.gridTemplateColumns = '1fr';
+            } else if (view === 'pre') {
+                cardPre.style.display = 'block';
+                cardPost.style.display = 'none';
+                grid.style.gridTemplateColumns = '1fr';
+            }
+        }
 
         function refreshStats() {
             fetch('/stats')
@@ -225,13 +416,38 @@ R"rawhtml(<!DOCTYPE html>
                     if (data.numCams !== lastNumCams) {
                         lastNumCams = data.numCams;
                         document.getElementById('live-pill').innerText = data.numCams + ' CAMERAS ACTIVE';
-                        document.getElementById('stream-title').innerText = 'Synchronized ' + data.numCams + '-Camera Grid';
+                        document.getElementById('title-pre').innerText = 'Pre-Inference Input (' + data.numCams + ' Cams)';
+                        document.getElementById('title-post').innerText = 'Post-Inference YOLOv10 (' + data.numCams + ' Cams)';
 
-                        let linkHtml = 'Direct Feeds: <a href="/stream" target="_blank">All Grid</a>';
+                        let linkHtml = 'Cameras: ';
                         for (let i = 0; i < data.numCams; i++) {
-                            linkHtml += ` &bull; <a href="/cam${i}" target="_blank">Camera ${i}</a>`;
+                            linkHtml += ` <a href="/cam${i}" target="_blank">Cam ${i} (Det)</a> &bull; <a href="/cam${i}_pre" target="_blank">Cam ${i} (Pre)</a>`;
+                            if (i < data.numCams - 1) linkHtml += ' | ';
                         }
                         document.getElementById('direct-links').innerHTML = linkHtml;
+                    }
+
+                    if (data.cameras && JSON.stringify(data.cameras) !== JSON.stringify(currentCameras)) {
+                        currentCameras = data.cameras;
+                        let html = '';
+                        for (const c of currentCameras) {
+                            html += `
+                            <div class="cam-item">
+                                <div class="cam-item-top">
+                                    <span class="cam-id-badge">CAM ${c.index}</span>
+                                    <span class="cam-model">${c.model || 'Lucid TRI023S-C'}</span>
+                                </div>
+                                <div class="cam-serial-row">
+                                    <code class="cam-serial-code" title="Click to copy" onclick="copyText('${c.serial}', this)">${c.serial}</code>
+                                    <button class="btn-copy" onclick="copyText('${c.serial}', this)">Copy</button>
+                                </div>
+                                <div style="font-size: 11px; color: #64748b;">IP: ${c.ip || 'N/A'}</div>
+                            </div>`;
+                        }
+                        if (currentCameras.length === 0) {
+                            html = '<div style="color: #64748b; font-size: 13px; padding: 8px;">No camera hardware metadata registered.</div>';
+                        }
+                        document.getElementById('cam-grid-container').innerHTML = html;
                     }
                 })
                 .catch(() => {});
@@ -259,6 +475,12 @@ R"rawhtml(<!DOCTYPE html>
             s = m_latestStats;
         }
 
+        std::vector<CameraDetail> cams;
+        {
+            std::lock_guard<std::mutex> lock(m_cameraMutex);
+            cams = m_cameraDetails;
+        }
+
         std::ostringstream json;
         json << "{"
              << "\"frameId\":" << s.frameId << ","
@@ -267,8 +489,19 @@ R"rawhtml(<!DOCTYPE html>
              << "\"capWorkMs\":" << s.capWorkMs << ","
              << "\"trtMs\":" << s.trtMs << ","
              << "\"packetDrops\":" << s.packetDrops << ","
-             << "\"numCams\":" << s.numCams
-             << "}";
+             << "\"numCams\":" << s.numCams << ","
+             << "\"cameras\":[";
+
+        for (size_t i = 0; i < cams.size(); ++i) {
+            json << "{"
+                 << "\"index\":" << cams[i].index << ","
+                 << "\"serial\":\"" << cams[i].serial << "\","
+                 << "\"model\":\"" << cams[i].model << "\","
+                 << "\"ip\":\"" << cams[i].ip << "\""
+                 << "}";
+            if (i + 1 < cams.size()) json << ",";
+        }
+        json << "]}";
 
         std::string jsonStr = json.str();
         std::ostringstream response;
@@ -282,12 +515,16 @@ R"rawhtml(<!DOCTYPE html>
         close(clientFd);
     }
 
-    void serveSnapshot(int clientFd) {
+    void serveSnapshot(int clientFd, int streamType = 0) {
         cv::Mat snap;
         {
             std::lock_guard<std::mutex> lock(m_frameMutex);
-            if (!m_latestImages.empty()) {
-                snap = composeGrid(m_latestImages, m_latestStats.frameId, m_latestStats.packetDrops);
+            if (streamType == 1 && !m_latestPreImages.empty()) {
+                snap = composeGrid(m_latestPreImages, m_latestStats.frameId, m_latestStats.packetDrops, "PRE CAM ");
+            } else if (streamType == 2 && (!m_latestPostImages.empty() || !m_latestPreImages.empty())) {
+                snap = composeCombined(m_latestPreImages, m_latestPostImages, m_latestStats.frameId, m_latestStats.packetDrops);
+            } else if (!m_latestPostImages.empty()) {
+                snap = composeGrid(m_latestPostImages, m_latestStats.frameId, m_latestStats.packetDrops, "DET CAM ");
             }
         }
 
@@ -311,7 +548,7 @@ R"rawhtml(<!DOCTYPE html>
         close(clientFd);
     }
 
-    void serveMjpegStream(int clientFd, int camIdx) {
+    void serveMjpegStream(int clientFd, int camIdx, int streamType = 0) {
         std::string streamHeader = 
             "HTTP/1.1 200 OK\r\n"
             "Server: FourEyes-MJPEG\r\n"
@@ -334,20 +571,24 @@ R"rawhtml(<!DOCTYPE html>
 
             {
                 std::lock_guard<std::mutex> lock(m_frameMutex);
-                if (!m_latestImages.empty() && m_latestStats.frameId != lastServedFrameId) {
+                const auto& targetImages = (streamType == 1) ? m_latestPreImages : m_latestPostImages;
+                if (!targetImages.empty() && m_latestStats.frameId != lastServedFrameId) {
                     int frameId = m_latestStats.frameId;
                     uint64_t drops = m_latestStats.packetDrops;
 
-                    if (camIdx >= 0 && camIdx < (int)m_latestImages.size()) {
-                        // Stream a single specific camera
-                        cv::resize(m_latestImages[camIdx], displayFrame, cv::Size(960, 600));
-                        std::string label = "CAM " + std::to_string(camIdx) + " | #" + std::to_string(frameId) + 
+                    if (streamType == 2) {
+                        displayFrame = composeCombined(m_latestPreImages, m_latestPostImages, frameId, drops);
+                    } else if (camIdx >= 0 && camIdx < (int)targetImages.size()) {
+                        cv::Mat bgr = ensureBGR(targetImages[camIdx]);
+                        cv::resize(bgr, displayFrame, cv::Size(960, 600));
+                        std::string prefix = (streamType == 1) ? "PRE CAM " : "DET CAM ";
+                        std::string label = prefix + std::to_string(camIdx) + " | #" + std::to_string(frameId) + 
                                             " | Drops: " + std::to_string(drops);
                         cv::putText(displayFrame, label, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, 
                                     (drops > 0 ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0)), 2);
                     } else {
-                        // Stream multi-camera composite grid
-                        displayFrame = composeGrid(m_latestImages, frameId, drops);
+                        std::string prefix = (streamType == 1) ? "PRE CAM " : "DET CAM ";
+                        displayFrame = composeGrid(targetImages, frameId, drops, prefix);
                     }
                     lastServedFrameId = frameId;
                 }
@@ -363,19 +604,12 @@ R"rawhtml(<!DOCTYPE html>
                            << "Content-Length: " << jpegBuf.size() << "\r\n\r\n";
 
                 std::string headerStr = partHeader.str();
-                if (!sendAll(clientFd, headerStr.data(), headerStr.size())) {
-                    break;
-                }
-                if (!sendAll(clientFd, reinterpret_cast<const char*>(jpegBuf.data()), jpegBuf.size())) {
-                    break;
-                }
-                if (!sendString(clientFd, "\r\n")) {
-                    break;
-                }
+                if (!sendAll(clientFd, headerStr.c_str(), headerStr.length())) break;
+                if (!sendAll(clientFd, reinterpret_cast<const char*>(jpegBuf.data()), jpegBuf.size())) break;
+                if (!sendString(clientFd, "\r\n")) break;
             }
 
-            // Stream throttle for smooth display (~25-30 FPS)
-            std::this_thread::sleep_for(std::chrono::milliseconds(35));
+            std::this_thread::sleep_for(std::chrono::milliseconds(25)); // ~40 FPS stream pacing
         }
 
         close(clientFd);
@@ -404,18 +638,29 @@ R"rawhtml(<!DOCTYPE html>
         } else if (path == "/stats") {
             serveStatsJson(clientFd);
         } else if (path == "/snapshot") {
-            serveSnapshot(clientFd);
+            serveSnapshot(clientFd, 0);
+        } else if (path == "/pre_snapshot") {
+            serveSnapshot(clientFd, 1);
+        } else if (path == "/combined_snapshot") {
+            serveSnapshot(clientFd, 2);
+        } else if (path == "/stream" || path == "/post_stream") {
+            serveMjpegStream(clientFd, -1, 0);
+        } else if (path == "/pre_stream") {
+            serveMjpegStream(clientFd, -1, 1);
+        } else if (path == "/combined_stream" || path == "/dual_stream") {
+            serveMjpegStream(clientFd, -1, 2);
         } else if (path.rfind("/cam", 0) == 0) {
-            // Parses any /cam0, /cam1, /cam2, /cam3, ..., /cam7 dynamically
+            bool isPre = (path.find("_pre") != std::string::npos);
             int camIdx = 0;
             try {
-                camIdx = std::stoi(path.substr(4));
+                size_t start = 4;
+                size_t end = path.find('_');
+                if (end == std::string::npos) end = path.length();
+                camIdx = std::stoi(path.substr(start, end - start));
             } catch (...) {
                 camIdx = 0;
             }
-            serveMjpegStream(clientFd, camIdx);
-        } else if (path == "/stream") {
-            serveMjpegStream(clientFd, -1);
+            serveMjpegStream(clientFd, camIdx, isPre ? 1 : 0);
         } else {
             std::string notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             sendString(clientFd, notFound);
@@ -510,13 +755,31 @@ public:
         std::cout << "[Web Server] Stopped cleanly.\n";
     }
 
-    void updateFrame(const std::vector<cv::Mat>& bgrImages, const WebStats& stats) {
+    void updateFrames(const std::vector<cv::Mat>& preImages,
+                      const std::vector<cv::Mat>& postImages,
+                      const WebStats& stats) {
         std::lock_guard<std::mutex> lock(m_frameMutex);
-        m_latestImages.clear();
-        m_latestImages.reserve(bgrImages.size());
-        for (const auto& img : bgrImages) {
-            m_latestImages.push_back(img.clone());
+        m_latestPreImages.clear();
+        m_latestPreImages.reserve(preImages.size());
+        for (const auto& img : preImages) {
+            m_latestPreImages.push_back(img.clone());
         }
+
+        m_latestPostImages.clear();
+        m_latestPostImages.reserve(postImages.size());
+        for (const auto& img : postImages) {
+            m_latestPostImages.push_back(img.clone());
+        }
+
         m_latestStats = stats;
+    }
+
+    void updateFrame(const std::vector<cv::Mat>& bgrImages, const WebStats& stats) {
+        updateFrames(bgrImages, bgrImages, stats);
+    }
+
+    void setCameraDetails(const std::vector<CameraDetail>& details) {
+        std::lock_guard<std::mutex> lock(m_cameraMutex);
+        m_cameraDetails = details;
     }
 };
