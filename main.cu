@@ -22,6 +22,7 @@
 
 #include <prepostprocessor.h>
 #include <bayer_letterbox.h>
+#include <byte_tracker.hpp>
 
 // ==============================================================================
 // MODULAR WEB SERVER CONFIGURATION
@@ -33,6 +34,14 @@
 #if ENABLE_WEB_SERVER
 #include <web_streamer.hpp>
 #endif
+
+// ==============================================================================
+// 2D MULTI-OBJECT TRACKING (ByteTrack-style, per camera, see include/byte_tracker.hpp)
+// Set to 1 to track detections across frames and draw "ID:n class score" overlays
+// (confirmed tracks only, detections >= tracker low_thresh feed the tracker)
+// Set to 0 for the original behaviour: raw detections >= 0.45 drawn with no IDs
+// ==============================================================================
+#define ENABLE_TRACKING 1
 
 std::atomic<bool> g_running(true);
 std::atomic<uint64_t> g_packetDrops(0);
@@ -80,6 +89,7 @@ struct InferenceStats {
     int totalFrames = 0;
     double sumPreMs = 0.0;
     double sumTrtMs = 0.0;
+    double sumPostMs = 0.0;
     double sumTotalMs = 0.0;
     std::chrono::high_resolution_clock::time_point startTime;
     std::chrono::high_resolution_clock::time_point endTime;
@@ -477,6 +487,90 @@ std::vector<cv::Mat> drawDetections(const float* output,
     return drawn;
 }
 
+#if ENABLE_TRACKING
+// Tracking variant of drawDetections(): decodes the raw YOLOv10 output into original-image boxes,
+// advances the per-camera ByteTrack by one frame, then draws only the confirmed tracks that were
+// updated in this frame (green box + "ID:n class score").
+std::vector<cv::Mat> trackAndDraw(const float* output,
+                                  int batchSize,
+                                  const std::vector<cv::Mat>& bayerImages,
+                                  const LetterboxInfo& info,
+                                  uint32_t swapRBMask,   // bit i set -> camera i is BGGR (flipped 180 deg)
+                                  tracker2d::MultiCamByteTracker& tracker,
+                                  std::vector<tracker2d::Detection>& dets,   // scratch, reused every call
+                                  int numDets = 300)
+{
+    const int stride = 6;  // x1, y1, x2, y2, score, class
+    const int n = std::min<int>(batchSize, static_cast<int>(bayerImages.size()));
+    const float minScore = tracker.config().low_thresh;   // the tracker ignores anything below this anyway
+    std::vector<cv::Mat> drawn(n);
+
+    for (int b = 0; b < n; ++b) {
+        // 1. Raw output -> original-image boxes (same letterbox undo + clamp as drawDetections)
+        dets.clear();
+        const float* det = output + static_cast<size_t>(b) * numDets * stride;
+        for (int d = 0; d < numDets; ++d, det += stride) {
+            const float score = det[4];
+            if (score < minScore) continue;
+
+            float x1 = (det[0] - info.padX) / info.scale;
+            float y1 = (det[1] - info.padY) / info.scale;
+            float x2 = (det[2] - info.padX) / info.scale;
+            float y2 = (det[3] - info.padY) / info.scale;
+
+            x1 = std::max(0.0f, std::min(x1, static_cast<float>(info.origWid  - 1)));
+            x2 = std::max(0.0f, std::min(x2, static_cast<float>(info.origWid  - 1)));
+            y1 = std::max(0.0f, std::min(y1, static_cast<float>(info.origHeig - 1)));
+            y2 = std::max(0.0f, std::min(y2, static_cast<float>(info.origHeig - 1)));
+
+            const float w = x2 - x1;
+            const float h = y2 - y1;
+            if (w < 1.0f || h < 1.0f) continue;   // degenerate after clamping
+
+            dets.push_back({cv::Rect2f(x1, y1, w, h), score, static_cast<int>(det[5])});
+        }
+
+        // 2. Tracking (high/low split, GIoU + IoU association, Kalman) for camera b
+        tracker.update(b, dets);
+
+        // 3. Debayer for display (OpenCV's Bayer names are shifted vs GenICam, see drawDetections)
+        const int bayerCode = ((swapRBMask >> b) & 1u) ? cv::COLOR_BayerRG2BGR : cv::COLOR_BayerBG2BGR;
+        cv::cvtColor(bayerImages[b], drawn[b], bayerCode);
+
+        // 4. Draw confirmed tracks updated this frame
+        const cv::Rect imgRect(0, 0, drawn[b].cols, drawn[b].rows);
+        const cv::Scalar color(0, 255, 0);
+        for (const auto& t : tracker.tracks(b)) {
+            if (!t.isReportable()) continue;
+
+            cv::Rect box(cvRound(t.bbox.x), cvRound(t.bbox.y), cvRound(t.bbox.width), cvRound(t.bbox.height));
+            box &= imgRect;
+            if (box.width <= 0 || box.height <= 0) continue;
+            cv::rectangle(drawn[b], box, color, 3);
+
+            const int cls = t.label;
+            const std::string name = (cls >= 0 && cls < static_cast<int>(kClassNames.size()))
+                                         ? kClassNames[cls]
+                                         : std::to_string(cls);
+            char score_str[16];
+            std::snprintf(score_str, sizeof(score_str), " %.2f", t.score);
+            const std::string label = "ID:" + std::to_string(t.id) + " " + name + score_str;
+
+            int baseline = 0;
+            const cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseline);
+            const int ty = std::max(box.y, ts.height + 6);  // keep label inside the image
+            cv::rectangle(drawn[b],
+                          cv::Point(box.x, ty - ts.height - 6),
+                          cv::Point(box.x + ts.width, ty + baseline - 4),
+                          color, cv::FILLED);
+            cv::putText(drawn[b], label, cv::Point(box.x, ty - 6),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 2);
+        }
+    }
+    return drawn;
+}
+#endif
+
 
 bool preProcessChecker(float* preProcessCPU, float* preProcessorGPU) {
     size_t dataSize = 640*640*3;
@@ -612,13 +706,15 @@ void captureWorker(int numCams,
         double cap_duration_ms = std::chrono::duration<double, std::milli>(t_cap_end - t_cap_start).count();
         double cap_interval_ms = std::chrono::duration<double, std::milli>(t_cap_end - t_prev_capture).count();
         t_prev_capture = t_cap_end;
-        double cap_fps = (frameCounter > 1 && cap_interval_ms > 0.0) ? (1000.0 / cap_interval_ms) : (1000.0 / cap_duration_ms);
+        double inst_cap_fps = (frameCounter > 1 && cap_interval_ms > 0.0) ? (1000.0 / cap_interval_ms) : (1000.0 / cap_duration_ms);
+        static double smooth_cap_fps = 0.0;
+        smooth_cap_fps = (smooth_cap_fps <= 0.0) ? inst_cap_fps : (0.85 * smooth_cap_fps + 0.15 * inst_cap_fps);
 
         stats.totalFrames++;
         stats.sumWorkMs += cap_duration_ms;
         stats.endTime = t_cap_end;
 
-        g_latestCapFps.store(static_cast<float>(cap_fps));
+        g_latestCapFps.store(static_cast<float>(smooth_cap_fps));
         g_latestCapWorkMs.store(static_cast<float>(cap_duration_ms));
 
         // Push the synchronized bundle into the thread-safe queue
@@ -629,7 +725,7 @@ void captureWorker(int numCams,
             std::cout << "[CAPTURE]   Frame " << frameCounter
                       << " | Work: " << cap_duration_ms << " ms"
                       << " | Cycle: " << cap_interval_ms << " ms"
-                      << " | Rate: " << cap_fps << " FPS"
+                      << " | Rate: " << smooth_cap_fps << " FPS"
                       << std::endl;
         }
     }
@@ -662,6 +758,25 @@ void inferenceWorker(int batchSize,
     constexpr int NET_W = 640, NET_H = 640;
     BayerLetterboxParams lp = makeBayerLetterboxParams(info.origWid, info.origHeig, NET_W, NET_H);
     lp.swapRBMask = swapRBMask;   // cameras that deliver BGGR (flipped 180 deg) get R/B swapped in the kernel
+
+#if ENABLE_TRACKING
+    // One tracker for the whole rig: independent track lists per camera, IDs unique across cameras.
+    // Defaults match the ROS node. Tune here (e.g. trackerCfg.label_max to keep only the classes you
+    // care about, trackerCfg.max_age / confirm_hits, which are counted in processed frames).
+    tracker2d::Tracker2DConfig trackerCfg;
+    tracker2d::MultiCamByteTracker tracker(batchSize, trackerCfg);
+    std::vector<tracker2d::Detection> trackDets;   // scratch for the decoded detections
+    trackDets.reserve(300);
+#endif
+
+    // Overlay for one finished batch: tracked boxes with IDs (tracking on) or raw detections (off)
+    auto renderBatch = [&](const float* out, const FrameBundle& bundle) {
+#if ENABLE_TRACKING
+        return trackAndDraw(out, batchSize, bundle.images, info, swapRBMask, tracker, trackDets);
+#else
+        return drawDetections(out, batchSize, bundle.images, info, swapRBMask);
+#endif
+    };
  
     // Raw Bayer staging: CPU writes rawPinned -> H2D copy -> rawDev -> kernel reads rawDev.
     // One pair is enough because imagePreprocessorGPU_v5 blocks until the kernel has finished.
@@ -682,10 +797,18 @@ void inferenceWorker(int batchSize,
     cudaDeviceGetStreamPriorityRange(&prioLeast, &prioGreatest);
     cudaStream_t preProcess;
     cudaStreamCreateWithPriority(&preProcess, cudaStreamNonBlocking, prioGreatest);
- 
+
+    // Double-buffered CUDA events for pure GPU hardware timing (independent of CPU queue waits)
+    cudaEvent_t trtStart[2];
+    cudaEvent_t trtStop[2];
+    for (int i = 0; i < 2; ++i) {
+        cudaEventCreate(&trtStart[i]);
+        cudaEventCreate(&trtStop[i]);
+    }
+
     int currentSlot = 0;
     int nextSlot = 1;
- 
+
     // --- PIPELINE SEEDING (Batch 0) ---
     FrameBundle currentBundle;
     if (!queue.pop(currentBundle, g_running)) {
@@ -693,13 +816,17 @@ void inferenceWorker(int batchSize,
         cudaStreamDestroy(preProcess);
         cudaFreeHost(rawPinned);
         cudaFree(rawDev);
+        for (int i = 0; i < 2; ++i) {
+            cudaEventDestroy(trtStart[i]);
+            cudaEventDestroy(trtStop[i]);
+        }
         return;
     }
- 
+
     inferCount++;
     auto t_work_start = std::chrono::high_resolution_clock::now();
     stats.startTime = t_work_start;
- 
+
     // Preprocess Batch 0 into Slot 0
     auto t_seed_pre_start = std::chrono::high_resolution_clock::now();
     if (!imagePreprocessorGPU_v5(currentBundle, batchSize, rawPinned, rawDev,
@@ -709,21 +836,24 @@ void inferenceWorker(int batchSize,
 
     auto t_seed_pre_end = std::chrono::high_resolution_clock::now();
     double last_pre_ms = std::chrono::duration<double, std::milli>(t_seed_pre_end - t_seed_pre_start).count();
- 
-    // Launch TensorRT on Batch 0 asynchronously
-    auto t_trt_start = std::chrono::high_resolution_clock::now();
+
+    // Launch TensorRT on Batch 0 asynchronously with hardware event timing
+    cudaEventRecord(trtStart[currentSlot], stream);
     context->setTensorAddress(inputName, inputs[currentSlot]);
     context->setTensorAddress(outputName, outputs[currentSlot]);
     context->enqueueV3(stream);
- 
+    cudaEventRecord(trtStop[currentSlot], stream);
+
+    double smooth_infer_fps = 0.0;
+
     // --- STEADY-STATE DOUBLE-BUFFERED PIPELINE LOOP ---
     while (g_running) {
         FrameBundle nextBundle;
-        // 1. Pop next bundle from queue
+        // 1. Pop next bundle from queue (blocks on camera 20 Hz frame arrival)
         if (!queue.pop(nextBundle, g_running)) {
             break; // Ctrl+C signaled shutdown
         }
- 
+
         // 2. OVERLAP: While GPU is busy inferring currentSlot on `stream`,
         //             the preProcess stream builds the tensor for nextBundle into nextSlot!
         auto t_pre_start = std::chrono::high_resolution_clock::now();
@@ -733,42 +863,52 @@ void inferenceWorker(int batchSize,
         }
         auto t_pre_end = std::chrono::high_resolution_clock::now();
         double pre_ms = std::chrono::duration<double, std::milli>(t_pre_end - t_pre_start).count();
- 
+
         // 3. Wait for currentSlot's TensorRT inference to finish on `stream`
         cudaStreamSynchronize(stream);
-        auto t_trt_end = std::chrono::high_resolution_clock::now();
-        double trt_ms = std::chrono::duration<double, std::milli>(t_trt_end - t_trt_start).count();
- 
-        auto t_work_end = t_trt_end;
-        double total_work_ms = std::chrono::duration<double, std::milli>(t_work_end - t_work_start).count();
-        double infer_interval_ms = std::chrono::duration<double, std::milli>(t_work_end - t_prev_infer).count();
-        t_prev_infer = t_work_end;
-        double infer_fps = (inferCount > 1 && infer_interval_ms > 0.0) ? (1000.0 / infer_interval_ms) : (1000.0 / total_work_ms);
- 
+
+        // Hardware-exact TensorRT GPU execution time (microsecond precision, zero CPU wait)
+        float trt_ms = 0.0f;
+        cudaEventElapsedTime(&trt_ms, trtStart[currentSlot], trtStop[currentSlot]);
+
         // 4. IMMEDIATELY launch TensorRT on the nextSlot (already preprocessed in background!)
         //    This keeps the GPU 100% saturated with ZERO idle wait time.
         inferCount++;
-        t_work_start = std::chrono::high_resolution_clock::now();
-        t_trt_start = t_work_start;
- 
+        cudaEventRecord(trtStart[nextSlot], stream);
         context->setTensorAddress(inputName, inputs[nextSlot]);
         context->setTensorAddress(outputName, outputs[nextSlot]);
         context->enqueueV3(stream);
+        cudaEventRecord(trtStop[nextSlot], stream);
+
+        // 5. Post-process (Tracking + Debayer + Drawing) on currentSlot
+        auto t_post_start = std::chrono::high_resolution_clock::now();
+        std::vector<cv::Mat> results = renderBatch(static_cast<float*>(outputs[currentSlot]), currentBundle);
+        auto t_post_end = std::chrono::high_resolution_clock::now();
+        double post_ms = std::chrono::duration<double, std::milli>(t_post_end - t_post_start).count();
+
+        // True active work latency on this frame (Pre + TRT GPU + Post/Tracking)
+        double total_work_ms = last_pre_ms + trt_ms + post_ms;
+
+        // Pipeline delivery rate (FPS)
+        auto t_work_end = t_post_end;
+        double infer_interval_ms = std::chrono::duration<double, std::milli>(t_work_end - t_prev_infer).count();
+        t_prev_infer = t_work_end;
+        double inst_fps = (inferCount > 1 && infer_interval_ms > 0.0) ? (1000.0 / infer_interval_ms) : (1000.0 / total_work_ms);
+        smooth_infer_fps = (smooth_infer_fps <= 0.0) ? inst_fps : (0.85 * smooth_infer_fps + 0.15 * inst_fps);
 
         stats.totalFrames++;
         stats.sumPreMs += last_pre_ms;
         stats.sumTrtMs += trt_ms;
+        stats.sumPostMs += post_ms;
         stats.sumTotalMs += total_work_ms;
         stats.endTime = t_work_end;
-
-        std::vector<cv::Mat> results = drawDetections(static_cast<float*>(outputs[currentSlot]), batchSize, currentBundle.images, info, swapRBMask);
 
 #if ENABLE_WEB_SERVER
         if (webServer) {
             WebStats wStats;
             wStats.frameId = currentBundle.frameId;
             wStats.capFps = g_latestCapFps.load();
-            wStats.infFps = infer_fps;
+            wStats.infFps = smooth_infer_fps;
             wStats.capWorkMs = g_latestCapWorkMs.load();
             wStats.trtMs = trt_ms;
             wStats.packetDrops = g_packetDrops.load();
@@ -776,38 +916,45 @@ void inferenceWorker(int batchSize,
             webServer->updateFrames(currentBundle.images, results, wStats);
         }
 #endif
- 
+
         {
             std::lock_guard<std::mutex> lock(g_coutMutex);
             std::cout << "[INFERENCE] Frame " << currentBundle.frameId
                       << " | Pre: " << last_pre_ms << " ms"
                       << " | TRT: " << trt_ms << " ms"
-                      << " | Total: " << total_work_ms << " ms"
-                      << " | Rate: " << infer_fps << " FPS"
+                      << " | Post: " << post_ms << " ms"
+                      << " | Active: " << total_work_ms << " ms"
+                      << " | Rate: " << smooth_infer_fps << " FPS"
                       << std::endl;
         }
- 
-        // 7. Ping-pong swap slots and hand over bundle
+
+        // 6. Ping-pong swap slots and hand over bundle
         last_pre_ms = pre_ms;
         currentBundle = std::move(nextBundle);
         std::swap(currentSlot, nextSlot);
     }
- 
+
     // Drain the final launched batch
     cudaStreamSynchronize(stream);
-    auto t_drain_end = std::chrono::high_resolution_clock::now();
-    double final_trt_ms = std::chrono::duration<double, std::milli>(t_drain_end - t_trt_start).count();
-    double final_total_ms = std::chrono::duration<double, std::milli>(t_drain_end - t_work_start).count();
+    float final_trt_ms = 0.0f;
+    cudaEventElapsedTime(&final_trt_ms, trtStart[currentSlot], trtStop[currentSlot]);
+
+    auto t_drain_post_start = std::chrono::high_resolution_clock::now();
+    std::vector<cv::Mat> finalResults = renderBatch(static_cast<float*>(outputs[currentSlot]), currentBundle);
+    auto t_drain_post_end = std::chrono::high_resolution_clock::now();
+    double final_post_ms = std::chrono::duration<double, std::milli>(t_drain_post_end - t_drain_post_start).count();
+
+    double final_total_ms = last_pre_ms + final_trt_ms + final_post_ms;
+    auto t_drain_end = t_drain_post_end;
     double final_interval_ms = std::chrono::duration<double, std::milli>(t_drain_end - t_prev_infer).count();
     double final_fps = (inferCount > 1 && final_interval_ms > 0.0) ? (1000.0 / final_interval_ms) : (1000.0 / final_total_ms);
- 
+
     stats.totalFrames++;
     stats.sumPreMs += last_pre_ms;
     stats.sumTrtMs += final_trt_ms;
+    stats.sumPostMs += final_post_ms;
     stats.sumTotalMs += final_total_ms;
     stats.endTime = t_drain_end;
-
-    std::vector<cv::Mat> finalResults = drawDetections(static_cast<float*>(outputs[currentSlot]), batchSize, currentBundle.images, info, swapRBMask);
 
 #if ENABLE_WEB_SERVER
     if (webServer) {
@@ -822,27 +969,32 @@ void inferenceWorker(int batchSize,
         webServer->updateFrames(currentBundle.images, finalResults, wStats);
     }
 #endif
- 
+
     {
         std::lock_guard<std::mutex> lock(g_coutMutex);
         std::cout << "[INFERENCE] Frame " << currentBundle.frameId
                   << " | Pre: " << last_pre_ms << " ms"
                   << " | TRT: " << final_trt_ms << " ms"
-                  << " | Total: " << final_total_ms << " ms"
+                  << " | Post: " << final_post_ms << " ms"
+                  << " | Active: " << final_total_ms << " ms"
                   << " | Rate: " << final_fps << " FPS"
                   << std::endl;
     }
- 
+
     std::cout << "[Inference Worker] Exiting cleanly...\n";
     cudaStreamDestroy(preProcess);
     cudaFreeHost(rawPinned);
     cudaFree(rawDev);
+    for (int i = 0; i < 2; ++i) {
+        cudaEventDestroy(trtStart[i]);
+        cudaEventDestroy(trtStop[i]);
+    }
 }
 
 
 
 int main() {
-    std::string engineFilePath = "/media/swdep/500GB_SSD_PERCEP/black_magic/yolov10x_dynamic_4_fp16.engine";
+    std::string engineFilePath = "/media/swdep/500GB_SSD_PERCEP/black_magic/yolov10x_dynamic_fp32.engine";
 
     std::ifstream engineFile(engineFilePath, std::ios::binary | std::ios::ate);
     if (!engineFile) {
@@ -1134,16 +1286,20 @@ int main() {
             double avgInfRate = (infStats.totalFrames - 1) / infWallSec;
             double avgPreMs = infStats.sumPreMs / infStats.totalFrames;
             double avgTrtMs = infStats.sumTrtMs / infStats.totalFrames;
+            double avgPostMs = infStats.sumPostMs / infStats.totalFrames;
             double avgTotalMs = infStats.sumTotalMs / infStats.totalFrames;
 
             std::cout << "[INFERENCE SUMMARY]:\n"
                       << "  Total Batches Inferred : " << infStats.totalFrames << "\n"
                       << "  Total Images Processed : " << infStats.totalFrames * batchSize << " (Batch Size: " << batchSize << ")\n"
                       << "  Avg Preprocessing Time : " << avgPreMs << " ms\n"
-                      << "  Avg TensorRT Time      : " << avgTrtMs << " ms\n"
-                      << "  Avg Total Latency      : " << avgTotalMs << " ms\n"
-                      << "  Avg Inference Rate     : " << avgInfRate << " FPS per camera\n"
-                      << "  Avg Total Throughput   : " << avgInfRate * batchSize << " images/sec\n";
+                      << "  Avg TensorRT GPU Time  : " << avgTrtMs << " ms (hardware execution via cudaEvent)\n"
+                      << "  Avg Post/Tracking Time : " << avgPostMs << " ms\n"
+                      << "  Avg Active Frame Work  : " << avgTotalMs << " ms\n"
+                      << "  Avg Pipeline Delivery  : " << avgInfRate << " FPS per camera\n"
+                      << "  Avg Pipeline Throughput: " << avgInfRate * batchSize << " images/sec\n"
+                      << "  Max Engine Throughput  : " << (avgTrtMs > 0 ? (1000.0 / avgTrtMs) : 0) << " batches/sec ("
+                      << (avgTrtMs > 0 ? (1000.0 / avgTrtMs) * batchSize : 0) << " images/sec)\n";
         } else {
             std::cout << "[INFERENCE SUMMARY]: Not enough frames inferred to compute average.\n";
         }
