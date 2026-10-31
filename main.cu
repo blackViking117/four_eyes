@@ -15,6 +15,10 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <set>
+#include <string>
+#include <array>
+#include <cstring>
 
 #include <prepostprocessor.h>
 #include <bayer_letterbox.h>
@@ -412,6 +416,7 @@ std::vector<cv::Mat> drawDetections(const float* output,
                                     int batchSize,
                                     const std::vector<cv::Mat>& bayerImages,
                                     const LetterboxInfo& info,
+                                    uint32_t swapRBMask,   // bit i set -> camera i is BGGR (flipped 180 deg)
                                     int numDets = 300,
                                     float confThresh = 0.45f)
 {
@@ -420,7 +425,9 @@ std::vector<cv::Mat> drawDetections(const float* output,
     std::vector<cv::Mat> drawn(n);
 
     for (int b = 0; b < n; ++b) {
-        cv::cvtColor(bayerImages[b], drawn[b], cv::COLOR_BayerBG2BGR);
+        // OpenCV's Bayer names are shifted vs GenICam: camera RGGB -> BayerBG, camera BGGR -> BayerRG
+        const int bayerCode = ((swapRBMask >> b) & 1u) ? cv::COLOR_BayerRG2BGR : cv::COLOR_BayerBG2BGR;
+        cv::cvtColor(bayerImages[b], drawn[b], bayerCode);
 
         const float* det = output + static_cast<size_t>(b) * numDets * stride;
 
@@ -640,7 +647,8 @@ void inferenceWorker(int batchSize,
                      cudaStream_t stream,
                      ThreadSafeQueue& queue,
                      InferenceStats& stats,
-                     LetterboxInfo& info
+                     LetterboxInfo& info,
+                     uint32_t swapRBMask
 #if ENABLE_WEB_SERVER
                      , MJPEGWebServer* webServer = nullptr
 #endif
@@ -652,7 +660,8 @@ void inferenceWorker(int batchSize,
  
     // Network input size (must match the engine and the tensors allocated in main)
     constexpr int NET_W = 640, NET_H = 640;
-    const BayerLetterboxParams lp = makeBayerLetterboxParams(info.origWid, info.origHeig, NET_W, NET_H);
+    BayerLetterboxParams lp = makeBayerLetterboxParams(info.origWid, info.origHeig, NET_W, NET_H);
+    lp.swapRBMask = swapRBMask;   // cameras that deliver BGGR (flipped 180 deg) get R/B swapped in the kernel
  
     // Raw Bayer staging: CPU writes rawPinned -> H2D copy -> rawDev -> kernel reads rawDev.
     // One pair is enough because imagePreprocessorGPU_v5 blocks until the kernel has finished.
@@ -752,7 +761,7 @@ void inferenceWorker(int batchSize,
         stats.sumTotalMs += total_work_ms;
         stats.endTime = t_work_end;
 
-        std::vector<cv::Mat> results = drawDetections(static_cast<float*>(outputs[currentSlot]), batchSize, currentBundle.images, info);
+        std::vector<cv::Mat> results = drawDetections(static_cast<float*>(outputs[currentSlot]), batchSize, currentBundle.images, info, swapRBMask);
 
 #if ENABLE_WEB_SERVER
         if (webServer) {
@@ -798,7 +807,7 @@ void inferenceWorker(int batchSize,
     stats.sumTotalMs += final_total_ms;
     stats.endTime = t_drain_end;
 
-    std::vector<cv::Mat> finalResults = drawDetections(static_cast<float*>(outputs[currentSlot]), batchSize, currentBundle.images, info);
+    std::vector<cv::Mat> finalResults = drawDetections(static_cast<float*>(outputs[currentSlot]), batchSize, currentBundle.images, info, swapRBMask);
 
 #if ENABLE_WEB_SERVER
     if (webServer) {
@@ -930,6 +939,10 @@ int main() {
         std::vector<Arena::IDevice*> arDevice(numCams, nullptr);
         std::vector<GenApi::INodeMap*> arNodeMap(numCams, nullptr);
 
+        // Bit i set -> camera i delivers BGGR (flipped 180 deg) instead of RGGB. Filled from the
+        // PixelFormat each camera reports after the flip, so it stays correct if the serial list changes.
+        uint32_t swapRBMask = 0;
+
         for (int i = 0; i < numCams; i++) {
             arDevice[i] = arSystem->CreateDevice(cameras[i]);
             arNodeMap[i] = arDevice[i]->GetNodeMap();
@@ -955,7 +968,14 @@ int main() {
             GenICam::gcstring pf = Arena::GetNodeValue<GenICam::gcstring>(arNodeMap[i], "PixelFormat");
             std::cout << "  Camera [" << i << "] " << serial
                     << " | rotate180=" << rotate180
-                    << " | PixelFormat=" << pf << "\n";
+                    << " | PixelFormat=" << pf << "\n" << std::flush;
+
+            if (pf == "BayerBG8") {
+                swapRBMask |= (1u << i);
+            } else if (pf != "BayerRG8") {
+                std::cerr << "[WARN] Camera " << i << " reports " << pf
+                          << " - kernel only handles BayerRG8 / BayerBG8\n";
+            }
 
             //exposure set to equal time for each camera
             Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "ExposureAuto", "Off");
@@ -1071,7 +1091,8 @@ int main() {
                                   stream, 
                                   std::ref(frameQueue),
                                   std::ref(infStats),
-                                  std::ref(info)
+                                  std::ref(info),
+                                  swapRBMask
 #if ENABLE_WEB_SERVER
                                   , &webServer
 #endif

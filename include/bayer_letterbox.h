@@ -10,6 +10,8 @@ struct BayerLetterboxParams {
     int dstW, dstH;   // network input canvas      (640 x 640, or 640 x 416 for a rect engine)
     int newW, newH;   // resized image inside it   (640 x 400)
     int padX, padY;   // its top-left in the canvas (0, 120)
+    uint32_t swapRBMask;  // bit i set -> camera i delivers BGGR (e.g. flipped 180 deg): the kernel
+                          // demosaics as RGGB and then swaps R and B. 0 = every camera is RGGB.
 };
 
 // Same arithmetic as your CPU path (scale = min ratio, round, centre the image),
@@ -25,6 +27,7 @@ inline BayerLetterboxParams makeBayerLetterboxParams(int srcW, int srcH, int dst
     p.newH = static_cast<int>(std::round(srcH * scale));
     p.padX = (dstW - p.newW) / 2;
     p.padY = (dstH - p.newH) / 2;
+    p.swapRBMask = 0;   // the caller sets this per camera after the call
     return p;
 }
 
@@ -34,7 +37,7 @@ inline size_t bayerPreviewBytes(const BayerLetterboxParams& p, int batch)
     return static_cast<size_t>(batch) * p.newW * p.newH * 3;
 }
 
-// raw     : [batch][srcH][srcW] uint8 RGGB Bayer, must be device-accessible (cudaMalloc'd is best)
+// raw     : [batch][srcH][srcW] uint8 Bayer (RGGB, or BGGR for cameras whose bit is set in p.swapRBMask), must be device-accessible (cudaMalloc'd is best)
 // out     : [batch][3][dstH][dstW] float, planar RGB, values in [0,1]   (this is the TensorRT input)
 // preview : optional (nullptr = off). [batch][newH][newW][3] uint8 BGR, the exact debayered +
 //           resized image the network sees WITHOUT the letterbox padding (640x400 for 1920x1200).

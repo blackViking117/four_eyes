@@ -86,6 +86,15 @@ __global__ void bayerLetterboxKernel(const uint8_t* __restrict__ raw,
             demosaicRGGB(img, p.srcW, p.srcH, (t & 1) ? x1 : x0, (t & 2) ? y1 : y0, r, g, b);
             accR += w * r;  accG += w * g;  accB += w * b;
         }
+
+        // Cameras flipped 180 deg deliver BGGR. Bilinear demosaicing is symmetric in R and B, so
+        // demosaicing as RGGB and swapping the two channels here gives the exact BGGR result.
+        if ((p.swapRBMask >> cam) & 1u) {
+            const float tmp = accR;
+            accR = accB;
+            accB = tmp;
+        }
+
         // resize output is uint8 in the CPU path, so quantise here too
         R = min(static_cast<int>(accR + 0.5f), 255);
         G = min(static_cast<int>(accG + 0.5f), 255);
