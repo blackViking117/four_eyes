@@ -1,0 +1,71 @@
+# ==============================================================================
+# Autonomous Vehicle Multi-Camera Perception & Obstacle Mask Pipeline Config
+# ==============================================================================
+
+# TensorRT Model Engine file path
+# Change this path to switch models (e.g. FP16 vs FP32, different YOLO versions)
+# without needing to recompile the project.
+engine_file: "/media/swdep/500GB_SSD_PERCEP/black_magic/yolov10x_dynamic_4_fp16.engine"
+
+# Ordered list of camera serial numbers
+# This defines the exact order of cameras in the batch and in the horizontal mask:
+#   Camera 0 (first in list)  -> Leftmost slice  [x: 0 .. 1920)
+#   Camera 1 (second in list) -> Second slice    [x: 1920 .. 3840)
+#   Camera 2 (third in list)  -> Third slice     [x: 3840 .. 5760)
+#   Camera 3 (fourth in list) -> Fourth slice    [x: 5760 .. 7680)
+# Reorder or add/remove cameras by editing this list:
+camera_serials:
+  - "253700866"
+  - "251400510"
+  - "254301431"
+  - "251102016"
+  # Other cameras on the vehicle:
+  # - "251102016"
+  # - "251400510"
+  # - "253700866"
+  # - "254301431"
+
+# Cameras mounted inverted (180 degrees) requiring hardware ReverseX & ReverseY
+rotate_180_serials:
+  - "251400510"
+  - "251102016"
+
+# ROS One (ROS 1) Node & Topic Configuration
+ros:
+  enabled: true
+  node_name: "four_eyes_perception"
+  # Topic on which the horizontally combined mono8 obstacle mask is published
+  mask_topic: "/obstacle_mask"
+  frame_id: "camera_array"
+  queue_size: 1
+
+# Mask Generation Options (mask_codec.hpp / mask_builder.hpp)
+mask:
+  # mono8 encoding using mask_codec.hpp:
+  #   bits [7:3] = instance id : 1..31 (0 = background)
+  #   bits [2:0] = class id    : 0..7
+  # Set true for mono8 (CV_8UC1, 1 byte/pixel), false for 3-channel (CV_8UC3)
+  single_channel: true
+
+  # Shape contour mode:
+  #   "BBOX"       - Full bounding rectangle fill (fastest, standard fallback)
+  #   "SHAPE_HULL" - FAST corner convex hull
+  #   "SHAPE_RROT" - Rotated minimum-area rectangle of FAST keypoints
+  #   "SHAPE_EDGE" - Canny edge silhouette convex hull (texture-independent)
+  mode: "BBOX"
+
+  # Confidence threshold for detections / mask painting
+  confidence_threshold: 0.45
+
+  # Shape refinement parameters (used when mode != BBOX)
+  min_box_px: 8
+  min_shape_fill: 0.20
+  max_keypoints: 300
+  canny_lo: 50
+  canny_hi: 150
+  close_ksize: 5
+
+# Live Web Streaming Monitor (MJPEG)
+web_server:
+  enabled: true
+  port: 8080

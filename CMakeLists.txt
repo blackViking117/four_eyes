@@ -10,11 +10,16 @@ set(CMAKE_CUDA_ARCHITECTURES 87) # NVIDIA Jetson AGX Orin (sm_87)
 # 1. Find OpenCV
 find_package(OpenCV REQUIRED)
 
-# 2. Define base paths
+# 2. Find ROS One (ROS 1) and YAML-CPP
+find_package(roscpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(yaml-cpp REQUIRED)
+
+# 3. Define base paths
 set(ARENA_SDK_ROOT "/home/swdep/Downloads/arena_ptp/ArenaSDK_v0.1.105_Linux_ARM64/ArenaSDK_Linux_ARM64")
 set(TENSORRT_ROOT "/media/swdep/500GB_SSD_PERCEP/black_magic/Armory/TensorRT-11.3.0.99")
 
-# 3. Add Include Directories
+# 4. Add Include Directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -23,14 +28,18 @@ include_directories(
     ${TENSORRT_ROOT}/include
     /usr/local/cuda/include
     ${OpenCV_INCLUDE_DIRS}
+    ${roscpp_INCLUDE_DIRS}
+    ${sensor_msgs_INCLUDE_DIRS}
+    ${YAML_CPP_INCLUDE_DIRS}
 )
 
-# 4. Add Library Search Paths
+# 5. Add Library Search Paths
 link_directories(
     ${ARENA_SDK_ROOT}/lib
     ${ARENA_SDK_ROOT}/GenICam/library/lib/Linux64_ARM
     ${TENSORRT_ROOT}/lib
     /usr/local/cuda/lib64
+    /opt/ros/one/lib
 )
 
 # 5. Automatically discover all source and header files in include and src folders (with CONFIGURE_DEPENDS)
@@ -56,10 +65,13 @@ target_link_libraries(test_app
     nvinfer
     cudart
     ${OpenCV_LIBS}
+    ${roscpp_LIBRARIES}
+    ${sensor_msgs_LIBRARIES}
+    yaml-cpp
 )
 
 # Ensure RPATH points to TensorRT and Arena libraries at runtime
 set_target_properties(test_app PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
-    INSTALL_RPATH "${TENSORRT_ROOT}/lib;${ARENA_SDK_ROOT}/lib;/usr/local/cuda/lib64"
+    INSTALL_RPATH "${TENSORRT_ROOT}/lib;${ARENA_SDK_ROOT}/lib;/usr/local/cuda/lib64;/opt/ros/one/lib"
 )

@@ -1,0 +1,11 @@
+<launch>
+    <!-- Default Configuration File -->
+    <arg name="config_file" default="$(find four_eyes)/config.yaml" />
+
+    <!-- Autonomous Vehicle Perception Node -->
+    <node pkg="four_eyes" type="test_app" name="four_eyes_perception" output="screen" args="$(arg config_file)">
+        <!-- Parameters can be overridden here or via config.yaml -->
+        <param name="config_file" value="$(arg config_file)" />
+    </node>
+</launch>
+

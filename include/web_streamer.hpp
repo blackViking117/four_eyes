@@ -28,6 +28,10 @@ struct WebStats {
     double trtMs = 0.0;
     uint64_t packetDrops = 0;
     int numCams = 0;
+    double trtFps = 0.0;
+    double postTrackFps = 0.0;
+    double postMs = 0.0;
+    int totalTargets = 0;
 };
 
 struct CameraDetail {
@@ -48,6 +52,10 @@ private:
     std::vector<cv::Mat> m_latestPostImages;
     std::vector<cv::Mat> m_latestPreImages;
     WebStats m_latestStats;
+
+    std::mutex m_maskMutex;
+    cv::Mat m_latestMask;
+    int m_latestMaskFrameId = -1;
 
     std::mutex m_cameraMutex;
     std::vector<CameraDetail> m_cameraDetails;
@@ -250,12 +258,28 @@ R"rawhtml(<!DOCTYPE html>
                 <div class="stat-val" id="st-cap-fps">-- FPS</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Inference Rate</div>
+                <div class="stat-label">Delivery Sync</div>
                 <div class="stat-val" id="st-inf-fps">-- FPS</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Active Targets</div>
+                <div class="stat-val val-ok" id="st-targets">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Raw TRT Speed</div>
+                <div class="stat-val" id="st-trt-fps" style="color: #38bdf8;">-- FPS</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Post-Track Speed</div>
+                <div class="stat-val" id="st-track-fps" style="color: #f59e0b;">-- FPS</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">TRT Latency</div>
                 <div class="stat-val" id="st-trt">-- ms</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Post/Track Time</div>
+                <div class="stat-val" id="st-post">-- ms</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Packet Drops</div>
@@ -311,6 +335,8 @@ R"rawhtml(<!DOCTYPE html>
             <span><a href="/pre_stream" target="_blank">Pre-Inference Grid</a></span>
             <span>&bull;</span>
             <span><a href="/combined_stream" target="_blank">Combined Dual Grid</a></span>
+            <span>&bull;</span>
+            <span><a href="/mask_stream" target="_blank" style="color: #38bdf8; font-weight: 600;">Horizontal Mask Stream</a></span>
             <span>&bull;</span>
             <span id="direct-links"></span>
             <span>&bull;</span>
@@ -404,6 +430,18 @@ R"rawhtml(<!DOCTYPE html>
                     document.getElementById('st-cap-fps').innerText = data.capFps.toFixed(1) + ' FPS';
                     document.getElementById('st-inf-fps').innerText = data.infFps.toFixed(1) + ' FPS';
                     document.getElementById('st-trt').innerText = data.trtMs.toFixed(1) + ' ms';
+                    if (document.getElementById('st-targets')) {
+                        document.getElementById('st-targets').innerText = data.totalTargets !== undefined ? data.totalTargets : 0;
+                    }
+                    if (document.getElementById('st-trt-fps')) {
+                        document.getElementById('st-trt-fps').innerText = (data.trtFps !== undefined && data.trtFps > 0) ? data.trtFps.toFixed(1) + ' FPS' : '-- FPS';
+                    }
+                    if (document.getElementById('st-track-fps')) {
+                        document.getElementById('st-track-fps').innerText = (data.postTrackFps !== undefined && data.postTrackFps > 0) ? data.postTrackFps.toFixed(1) + ' FPS' : '-- FPS';
+                    }
+                    if (document.getElementById('st-post')) {
+                        document.getElementById('st-post').innerText = (data.postMs !== undefined && data.postMs > 0) ? data.postMs.toFixed(1) + ' ms' : '-- ms';
+                    }
                     
                     const dropEl = document.getElementById('st-drops');
                     dropEl.innerText = data.packetDrops;
@@ -488,6 +526,10 @@ R"rawhtml(<!DOCTYPE html>
              << "\"infFps\":" << s.infFps << ","
              << "\"capWorkMs\":" << s.capWorkMs << ","
              << "\"trtMs\":" << s.trtMs << ","
+             << "\"trtFps\":" << s.trtFps << ","
+             << "\"postTrackFps\":" << s.postTrackFps << ","
+             << "\"postMs\":" << s.postMs << ","
+             << "\"totalTargets\":" << s.totalTargets << ","
              << "\"packetDrops\":" << s.packetDrops << ","
              << "\"numCams\":" << s.numCams << ","
              << "\"cameras\":[";
@@ -512,6 +554,103 @@ R"rawhtml(<!DOCTYPE html>
                  << "Connection: close\r\n\r\n"
                  << jsonStr;
         sendString(clientFd, response.str());
+        close(clientFd);
+    }
+
+    void serveMaskSnapshot(int clientFd) {
+        cv::Mat snap;
+        {
+            std::lock_guard<std::mutex> lock(m_maskMutex);
+            if (!m_latestMask.empty()) {
+                cv::Mat raw = m_latestMask;
+                if (raw.channels() == 1) {
+                    cv::Mat scaled;
+                    raw.convertTo(scaled, CV_8UC1, 7.0);
+                    cv::applyColorMap(scaled, snap, cv::COLORMAP_JET);
+                    snap.setTo(cv::Scalar(0, 0, 0), raw == 0);
+                } else {
+                    snap = raw.clone();
+                }
+            }
+        }
+
+        if (snap.empty()) {
+            std::string emptyResp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sendString(clientFd, emptyResp);
+            close(clientFd);
+            return;
+        }
+
+        std::vector<uchar> jpegBuf;
+        cv::imencode(".jpg", snap, jpegBuf, {cv::IMWRITE_JPEG_QUALITY, 85});
+
+        std::ostringstream response;
+        response << "HTTP/1.1 200 OK\r\n"
+                 << "Content-Type: image/jpeg\r\n"
+                 << "Content-Length: " << jpegBuf.size() << "\r\n"
+                 << "Connection: close\r\n\r\n";
+        sendString(clientFd, response.str());
+        sendAll(clientFd, reinterpret_cast<const char*>(jpegBuf.data()), jpegBuf.size());
+        close(clientFd);
+    }
+
+    void serveMaskStream(int clientFd) {
+        std::string streamHeader = 
+            "HTTP/1.1 200 OK\r\n"
+            "Server: FourEyes-MJPEG\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+            "Pragma: no-cache\r\n"
+            "Connection: close\r\n"
+            "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+
+        if (!sendString(clientFd, streamHeader)) {
+            close(clientFd);
+            return;
+        }
+
+        std::vector<uchar> jpegBuf;
+        std::vector<int> encodeParams = {cv::IMWRITE_JPEG_QUALITY, 70};
+        int lastServedFrameId = -1;
+
+        while (m_running) {
+            cv::Mat displayFrame;
+            {
+                std::lock_guard<std::mutex> lock(m_maskMutex);
+                if (!m_latestMask.empty() && m_latestMaskFrameId != lastServedFrameId) {
+                    cv::Mat raw = m_latestMask;
+                    lastServedFrameId = m_latestMaskFrameId;
+                    if (raw.channels() == 1) {
+                        cv::Mat scaled;
+                        raw.convertTo(scaled, CV_8UC1, 7.0);
+                        cv::applyColorMap(scaled, displayFrame, cv::COLORMAP_JET);
+                        displayFrame.setTo(cv::Scalar(0, 0, 0), raw == 0);
+                    } else {
+                        displayFrame = raw.clone();
+                    }
+                    if (displayFrame.cols > 1920) {
+                        float aspect = static_cast<float>(displayFrame.cols) / displayFrame.rows;
+                        cv::resize(displayFrame, displayFrame, cv::Size(1920, std::max(1, static_cast<int>(1920 / aspect))));
+                    }
+                }
+            }
+
+            if (!displayFrame.empty()) {
+                jpegBuf.clear();
+                cv::imencode(".jpg", displayFrame, jpegBuf, encodeParams);
+
+                std::ostringstream partHeader;
+                partHeader << "--frame\r\n"
+                           << "Content-Type: image/jpeg\r\n"
+                           << "Content-Length: " << jpegBuf.size() << "\r\n\r\n";
+
+                if (!sendString(clientFd, partHeader.str()) ||
+                    !sendAll(clientFd, reinterpret_cast<const char*>(jpegBuf.data()), jpegBuf.size()) ||
+                    !sendString(clientFd, "\r\n")) {
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
         close(clientFd);
     }
 
@@ -649,6 +788,10 @@ R"rawhtml(<!DOCTYPE html>
             serveMjpegStream(clientFd, -1, 1);
         } else if (path == "/combined_stream" || path == "/dual_stream") {
             serveMjpegStream(clientFd, -1, 2);
+        } else if (path == "/mask_stream") {
+            serveMaskStream(clientFd);
+        } else if (path == "/mask" || path == "/mask_snapshot") {
+            serveMaskSnapshot(clientFd);
         } else if (path.rfind("/cam", 0) == 0) {
             bool isPre = (path.find("_pre") != std::string::npos);
             int camIdx = 0;
@@ -776,6 +919,12 @@ public:
 
     void updateFrame(const std::vector<cv::Mat>& bgrImages, const WebStats& stats) {
         updateFrames(bgrImages, bgrImages, stats);
+    }
+
+    void updateMask(const cv::Mat& mask, int frameId = 0) {
+        std::lock_guard<std::mutex> lock(m_maskMutex);
+        m_latestMask = mask.clone();
+        m_latestMaskFrameId = frameId;
     }
 
     void setCameraDetails(const std::vector<CameraDetail>& details) {

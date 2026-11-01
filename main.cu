@@ -1,4 +1,5 @@
 #include <iostream>
+#include <iomanip>
 #include <thread>
 #include <chrono>
 #include <csignal>
@@ -19,6 +20,16 @@
 #include <string>
 #include <array>
 #include <cstring>
+#include <map>
+#include <memory>
+
+#include <ros/ros.h>
+#include <sensor_msgs/Image.h>
+#include <sensor_msgs/image_encodings.h>
+
+#include <mask_codec.hpp>
+#include <mask_builder.hpp>
+#include <pipeline_config.hpp>
 
 #include <prepostprocessor.h>
 #include <bayer_letterbox.h>
@@ -91,6 +102,7 @@ struct InferenceStats {
     double sumTrtMs = 0.0;
     double sumPostMs = 0.0;
     double sumTotalMs = 0.0;
+    uint64_t sumTargets = 0;
     std::chrono::high_resolution_clock::time_point startTime;
     std::chrono::high_resolution_clock::time_point endTime;
 };
@@ -427,23 +439,43 @@ std::vector<cv::Mat> drawDetections(const float* output,
                                     const std::vector<cv::Mat>& bayerImages,
                                     const LetterboxInfo& info,
                                     uint32_t swapRBMask,   // bit i set -> camera i is BGGR (flipped 180 deg)
+                                    cv::Mat& combinedMask,
+                                    const MaskOptions& maskOpt,
                                     int numDets = 300,
-                                    float confThresh = 0.45f)
+                                    float confThresh = 0.45f,
+                                    int* outTotalDets = nullptr)
 {
+    if (outTotalDets) *outTotalDets = 0;
     const int stride = 6;  // x1, y1, x2, y2, score, class
     const int n = std::min<int>(batchSize, static_cast<int>(bayerImages.size()));
     std::vector<cv::Mat> drawn(n);
+
+    const int W = info.origWid;
+    const int H = info.origHeig;
+    const int maskType = maskOpt.single_channel ? CV_8UC1 : CV_8UC3;
+
+    // Allocate horizontal combined mask canvas: Height H x Width (n * W)
+    combinedMask = cv::Mat::zeros(H, n * W, maskType);
 
     for (int b = 0; b < n; ++b) {
         // OpenCV's Bayer names are shifted vs GenICam: camera RGGB -> BayerBG, camera BGGR -> BayerRG
         const int bayerCode = ((swapRBMask >> b) & 1u) ? cv::COLOR_BayerRG2BGR : cv::COLOR_BayerBG2BGR;
         cv::cvtColor(bayerImages[b], drawn[b], bayerCode);
 
+        // Sub-region ROI in combinedMask for camera b (horizontal layout: [b*W .. (b+1)*W))
+        cv::Mat subMask = combinedMask(cv::Rect(b * W, 0, W, H));
+        cv::Mat gray;
+        if (maskOpt.mode != MaskMode::BBOX) {
+            cv::cvtColor(drawn[b], gray, cv::COLOR_BGR2GRAY);
+        }
+
         const float* det = output + static_cast<size_t>(b) * numDets * stride;
+        int instCounter = 0;
 
         for (int d = 0; d < numDets; ++d, det += stride) {
             const float score = det[4];
             if (score < confThresh) continue;
+            if (outTotalDets) (*outTotalDets)++;
 
             // Undo letterbox: remove padding, then undo scale
             float x1 = (det[0] - info.padX) / info.scale;
@@ -482,6 +514,11 @@ std::vector<cv::Mat> drawDetections(const float* output,
                           color, cv::FILLED);
             cv::putText(drawn[b], label, cv::Point(p1.x, ty - 6),
                         cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 2);
+
+            // Paint mask with mono8 codec: bits[7:3] instance id (1..31), bits[2:0] class id
+            int inst_id = std::min(++instCounter, maskcodec::MAX_INST);
+            cv::Rect box(p1, p2);
+            paintDetection(subMask, gray, box, inst_id, cls, maskOpt);
         }
     }
     return drawn;
@@ -489,8 +526,8 @@ std::vector<cv::Mat> drawDetections(const float* output,
 
 #if ENABLE_TRACKING
 // Tracking variant of drawDetections(): decodes the raw YOLOv10 output into original-image boxes,
-// advances the per-camera ByteTrack by one frame, then draws only the confirmed tracks that were
-// updated in this frame (green box + "ID:n class score").
+// advances the per-camera ByteTrack by one frame, then draws confirmed tracks on display images
+// and paints each detected object into the combined horizontal mask using the mask codec.
 std::vector<cv::Mat> trackAndDraw(const float* output,
                                   int batchSize,
                                   const std::vector<cv::Mat>& bayerImages,
@@ -498,12 +535,23 @@ std::vector<cv::Mat> trackAndDraw(const float* output,
                                   uint32_t swapRBMask,   // bit i set -> camera i is BGGR (flipped 180 deg)
                                   tracker2d::MultiCamByteTracker& tracker,
                                   std::vector<tracker2d::Detection>& dets,   // scratch, reused every call
-                                  int numDets = 300)
+                                  cv::Mat& combinedMask,
+                                  const MaskOptions& maskOpt,
+                                  int numDets = 300,
+                                  int* outTotalTracks = nullptr)
 {
+    if (outTotalTracks) *outTotalTracks = 0;
     const int stride = 6;  // x1, y1, x2, y2, score, class
     const int n = std::min<int>(batchSize, static_cast<int>(bayerImages.size()));
     const float minScore = tracker.config().low_thresh;   // the tracker ignores anything below this anyway
     std::vector<cv::Mat> drawn(n);
+
+    const int W = info.origWid;
+    const int H = info.origHeig;
+    const int maskType = maskOpt.single_channel ? CV_8UC1 : CV_8UC3;
+
+    // Allocate horizontal combined mask canvas: Height H x Width (n * W)
+    combinedMask = cv::Mat::zeros(H, n * W, maskType);
 
     for (int b = 0; b < n; ++b) {
         // 1. Raw output -> original-image boxes (same letterbox undo + clamp as drawDetections)
@@ -537,15 +585,25 @@ std::vector<cv::Mat> trackAndDraw(const float* output,
         const int bayerCode = ((swapRBMask >> b) & 1u) ? cv::COLOR_BayerRG2BGR : cv::COLOR_BayerBG2BGR;
         cv::cvtColor(bayerImages[b], drawn[b], bayerCode);
 
-        // 4. Draw confirmed tracks updated this frame
+        // 4. Sub-region ROI in combinedMask for camera b (horizontal layout: [b*W .. (b+1)*W))
+        cv::Mat subMask = combinedMask(cv::Rect(b * W, 0, W, H));
+        cv::Mat gray;
+        if (maskOpt.mode != MaskMode::BBOX) {
+            cv::cvtColor(drawn[b], gray, cv::COLOR_BGR2GRAY);
+        }
+
+        // 5. Draw confirmed tracks on display image AND paint into mask
         const cv::Rect imgRect(0, 0, drawn[b].cols, drawn[b].rows);
         const cv::Scalar color(0, 255, 0);
+        std::set<int> usedInstIds;
+
         for (const auto& t : tracker.tracks(b)) {
             if (!t.isReportable()) continue;
 
             cv::Rect box(cvRound(t.bbox.x), cvRound(t.bbox.y), cvRound(t.bbox.width), cvRound(t.bbox.height));
             box &= imgRect;
             if (box.width <= 0 || box.height <= 0) continue;
+            if (outTotalTracks) (*outTotalTracks)++;
             cv::rectangle(drawn[b], box, color, 3);
 
             const int cls = t.label;
@@ -565,6 +623,15 @@ std::vector<cv::Mat> trackAndDraw(const float* output,
                           color, cv::FILLED);
             cv::putText(drawn[b], label, cv::Point(box.x, ty - 6),
                         cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 2);
+
+            // Paint mask with mono8 codec: bits[7:3] instance id (1..31), bits[2:0] class id
+            int inst_id = (t.id > 0) ? (((t.id - 1) % maskcodec::MAX_INST) + 1) : 1;
+            while (usedInstIds.count(inst_id) && usedInstIds.size() < static_cast<size_t>(maskcodec::MAX_INST)) {
+                inst_id = (inst_id % maskcodec::MAX_INST) + 1;
+            }
+            usedInstIds.insert(inst_id);
+
+            paintDetection(subMask, gray, box, inst_id, cls, maskOpt);
         }
     }
     return drawn;
@@ -591,6 +658,9 @@ void sigintHandler(int) {
     g_running = false;
     if (g_queuePtr) {
         g_queuePtr->wakeUpAll();
+    }
+    if (ros::isInitialized()) {
+        ros::shutdown();
     }
 }
 
@@ -744,7 +814,11 @@ void inferenceWorker(int batchSize,
                      ThreadSafeQueue& queue,
                      InferenceStats& stats,
                      LetterboxInfo& info,
-                     uint32_t swapRBMask
+                     uint32_t swapRBMask,
+                     const PipelineConfig& config,
+                     ros::Publisher* maskPub = nullptr,
+                     ros::Publisher* maskVizPub = nullptr,
+                     ros::Publisher* detPub = nullptr
 #if ENABLE_WEB_SERVER
                      , MJPEGWebServer* webServer = nullptr
 #endif
@@ -769,12 +843,13 @@ void inferenceWorker(int batchSize,
     trackDets.reserve(300);
 #endif
 
-    // Overlay for one finished batch: tracked boxes with IDs (tracking on) or raw detections (off)
-    auto renderBatch = [&](const float* out, const FrameBundle& bundle) {
+    // Overlay for one finished batch: tracked boxes with IDs (tracking on) or raw detections (off),
+    // and paints each detected object into combinedMask according to the mono8 mask codec
+    auto renderBatch = [&](const float* out, const FrameBundle& bundle, cv::Mat& combinedMask, int* outTargets = nullptr) {
 #if ENABLE_TRACKING
-        return trackAndDraw(out, batchSize, bundle.images, info, swapRBMask, tracker, trackDets);
+        return trackAndDraw(out, batchSize, bundle.images, info, swapRBMask, tracker, trackDets, combinedMask, config.mask_options, 300, outTargets);
 #else
-        return drawDetections(out, batchSize, bundle.images, info, swapRBMask);
+        return drawDetections(out, batchSize, bundle.images, info, swapRBMask, combinedMask, config.mask_options, 300, config.confidence_threshold, outTargets);
 #endif
     };
  
@@ -845,6 +920,8 @@ void inferenceWorker(int batchSize,
     cudaEventRecord(trtStop[currentSlot], stream);
 
     double smooth_infer_fps = 0.0;
+    double smooth_trt_fps = 0.0;
+    double smooth_compute_fps = 0.0;
 
     // --- STEADY-STATE DOUBLE-BUFFERED PIPELINE LOOP ---
     while (g_running) {
@@ -880,27 +957,144 @@ void inferenceWorker(int batchSize,
         context->enqueueV3(stream);
         cudaEventRecord(trtStop[nextSlot], stream);
 
-        // 5. Post-process (Tracking + Debayer + Drawing) on currentSlot
+        // 5. Post-process (Tracking + Debayer + Drawing + Mask Generation) on currentSlot
         auto t_post_start = std::chrono::high_resolution_clock::now();
-        std::vector<cv::Mat> results = renderBatch(static_cast<float*>(outputs[currentSlot]), currentBundle);
+        cv::Mat combinedMask;
+        int numTargets = 0;
+        std::vector<cv::Mat> results = renderBatch(static_cast<float*>(outputs[currentSlot]), currentBundle, combinedMask, &numTargets);
         auto t_post_end = std::chrono::high_resolution_clock::now();
         double post_ms = std::chrono::duration<double, std::milli>(t_post_end - t_post_start).count();
+
+        // 5b. Publish horizontally combined mask and visualization topics to ROS One node
+        if (config.ros.enabled && ros::ok()) {
+            static std::unique_ptr<ros::NodeHandle> lazyNh;
+            static std::unique_ptr<ros::Publisher> lazyPub;
+            static std::unique_ptr<ros::Publisher> lazyVizPub;
+            static std::unique_ptr<ros::Publisher> lazyDetPub;
+            if (!maskPub) {
+                static int retryCounter = 0;
+                if (++retryCounter % 50 == 1 && ros::master::check()) {
+                    lazyNh = std::unique_ptr<ros::NodeHandle>(new ros::NodeHandle());
+                    lazyPub = std::unique_ptr<ros::Publisher>(new ros::Publisher(
+                        lazyNh->advertise<sensor_msgs::Image>(config.ros.mask_topic, config.ros.queue_size)));
+                    lazyVizPub = std::unique_ptr<ros::Publisher>(new ros::Publisher(
+                        lazyNh->advertise<sensor_msgs::Image>(config.ros.mask_topic + "/viz", 2)));
+                    lazyDetPub = std::unique_ptr<ros::Publisher>(new ros::Publisher(
+                        lazyNh->advertise<sensor_msgs::Image>("/camera_array/detections", 2)));
+                    maskPub = lazyPub.get();
+                    maskVizPub = lazyVizPub.get();
+                    detPub = lazyDetPub.get();
+                    std::cout << "[ROS 1] Connected to ROS master! Now publishing on:\n" 
+                              << "        - " << config.ros.mask_topic << " (raw mono8 mask)\n"
+                              << "        - " << config.ros.mask_topic << "/viz (colorized RViz mask)\n"
+                              << "        - /camera_array/detections (multi-camera overlay)" << std::endl;
+                }
+            }
+
+            if (maskPub) {
+                std_msgs::Header header;
+                header.seq = currentBundle.frameId;
+                if (currentBundle.ptpTimeStampNs > 0) {
+                    header.stamp.fromNSec(currentBundle.ptpTimeStampNs);
+                } else {
+                    header.stamp = ros::Time::now();
+                }
+                header.frame_id = config.ros.frame_id;
+
+                const std::string encoding = config.mask_options.single_channel 
+                    ? sensor_msgs::image_encodings::MONO8 
+                    : sensor_msgs::image_encodings::BGR8;
+
+                sensor_msgs::ImagePtr msg(new sensor_msgs::Image());
+                msg->header = header;
+                msg->height = combinedMask.rows;
+                msg->width = combinedMask.cols;
+                msg->encoding = encoding;
+                msg->is_bigendian = false;
+                msg->step = static_cast<sensor_msgs::Image::_step_type>(combinedMask.step);
+                const size_t dataSize = combinedMask.step * combinedMask.rows;
+                msg->data.resize(dataSize);
+                if (!combinedMask.empty()) {
+                    std::memcpy(msg->data.data(), combinedMask.data, dataSize);
+                }
+
+                maskPub->publish(msg);
+
+                // Publish colorized mask for RViz if someone is viewing it
+                if (maskVizPub && maskVizPub->getNumSubscribers() > 0 && !combinedMask.empty()) {
+                    cv::Mat viz;
+                    if (combinedMask.channels() == 1) {
+                        cv::Mat scaled;
+                        combinedMask.convertTo(scaled, CV_8UC1, 7.0);
+                        cv::applyColorMap(scaled, viz, cv::COLORMAP_JET);
+                        viz.setTo(cv::Scalar(0, 0, 0), combinedMask == 0);
+                    } else {
+                        viz = combinedMask;
+                    }
+
+                    sensor_msgs::ImagePtr vizMsg(new sensor_msgs::Image());
+                    vizMsg->header = header;
+                    vizMsg->height = viz.rows;
+                    vizMsg->width = viz.cols;
+                    vizMsg->encoding = sensor_msgs::image_encodings::BGR8;
+                    vizMsg->is_bigendian = false;
+                    vizMsg->step = static_cast<sensor_msgs::Image::_step_type>(viz.step);
+                    const size_t vizSize = viz.step * viz.rows;
+                    vizMsg->data.resize(vizSize);
+                    std::memcpy(vizMsg->data.data(), viz.data, vizSize);
+                    maskVizPub->publish(vizMsg);
+                }
+
+                // Publish combined detection images for RViz if someone is viewing it
+                if (detPub && detPub->getNumSubscribers() > 0 && !results.empty()) {
+                    cv::Mat combinedDets;
+                    cv::hconcat(results, combinedDets);
+
+                    sensor_msgs::ImagePtr detMsg(new sensor_msgs::Image());
+                    detMsg->header = header;
+                    detMsg->height = combinedDets.rows;
+                    detMsg->width = combinedDets.cols;
+                    detMsg->encoding = sensor_msgs::image_encodings::BGR8;
+                    detMsg->is_bigendian = false;
+                    detMsg->step = static_cast<sensor_msgs::Image::_step_type>(combinedDets.step);
+                    const size_t detSize = combinedDets.step * combinedDets.rows;
+                    detMsg->data.resize(detSize);
+                    std::memcpy(detMsg->data.data(), combinedDets.data, detSize);
+                    detPub->publish(detMsg);
+                }
+
+                ros::spinOnce();
+            }
+        }
 
         // True active work latency on this frame (Pre + TRT GPU + Post/Tracking)
         double total_work_ms = last_pre_ms + trt_ms + post_ms;
 
-        // Pipeline delivery rate (FPS)
+        // 1. Raw TensorRT GPU throughput capability (before tracking / CPU post-processing)
+        double inst_trt_fps = (trt_ms > 0.0f) ? (1000.0 / trt_ms) : 0.0;
+        smooth_trt_fps = (smooth_trt_fps <= 0.0) ? inst_trt_fps : (0.85 * smooth_trt_fps + 0.15 * inst_trt_fps);
+
+        // 2. Full pipeline active compute capability (AFTER tracking, drawing, debayering, and mask painting)
+        //    This drops as numTargets increases due to ByteTrack Kalman + matching + mask painting!
+        double inst_compute_fps = (total_work_ms > 0.0) ? (1000.0 / total_work_ms) : 0.0;
+        smooth_compute_fps = (smooth_compute_fps <= 0.0) ? inst_compute_fps : (0.85 * smooth_compute_fps + 0.15 * inst_compute_fps);
+
+        // 3. FPS drop caused by tracking and post-processing
+        double fps_drop = smooth_trt_fps - smooth_compute_fps;
+
+        // 4. Pipeline delivery rate (sync rate throttled by camera shutter, e.g. 20 Hz)
         auto t_work_end = t_post_end;
         double infer_interval_ms = std::chrono::duration<double, std::milli>(t_work_end - t_prev_infer).count();
         t_prev_infer = t_work_end;
-        double inst_fps = (inferCount > 1 && infer_interval_ms > 0.0) ? (1000.0 / infer_interval_ms) : (1000.0 / total_work_ms);
-        smooth_infer_fps = (smooth_infer_fps <= 0.0) ? inst_fps : (0.85 * smooth_infer_fps + 0.15 * inst_fps);
+        double inst_delivery_fps = (inferCount > 1 && infer_interval_ms > 0.0) ? (1000.0 / infer_interval_ms) : inst_compute_fps;
+        smooth_infer_fps = (smooth_infer_fps <= 0.0) ? inst_delivery_fps : (0.85 * smooth_infer_fps + 0.15 * inst_delivery_fps);
 
         stats.totalFrames++;
         stats.sumPreMs += last_pre_ms;
         stats.sumTrtMs += trt_ms;
         stats.sumPostMs += post_ms;
         stats.sumTotalMs += total_work_ms;
+        stats.sumTargets += numTargets;
         stats.endTime = t_work_end;
 
 #if ENABLE_WEB_SERVER
@@ -913,18 +1107,25 @@ void inferenceWorker(int batchSize,
             wStats.trtMs = trt_ms;
             wStats.packetDrops = g_packetDrops.load();
             wStats.numCams = batchSize;
+            wStats.trtFps = smooth_trt_fps;
+            wStats.postTrackFps = smooth_compute_fps;
+            wStats.postMs = post_ms;
+            wStats.totalTargets = numTargets;
             webServer->updateFrames(currentBundle.images, results, wStats);
+            webServer->updateMask(combinedMask, currentBundle.frameId);
         }
 #endif
 
         {
             std::lock_guard<std::mutex> lock(g_coutMutex);
             std::cout << "[INFERENCE] Frame " << currentBundle.frameId
-                      << " | Pre: " << last_pre_ms << " ms"
-                      << " | TRT: " << trt_ms << " ms"
+                      << " | Targets: " << numTargets
+                      << " | Pre: " << std::fixed << std::setprecision(1) << last_pre_ms << " ms"
+                      << " | TRT: " << trt_ms << " ms (" << std::fixed << std::setprecision(1) << smooth_trt_fps << " FPS)"
                       << " | Post: " << post_ms << " ms"
-                      << " | Active: " << total_work_ms << " ms"
-                      << " | Rate: " << smooth_infer_fps << " FPS"
+                      << " | Post-Track: " << smooth_compute_fps << " FPS"
+                      << " (Drop: -" << std::fixed << std::setprecision(1) << (fps_drop > 0.0 ? fps_drop : 0.0) << " FPS)"
+                      << " | Sync: " << smooth_infer_fps << " FPS"
                       << std::endl;
         }
 
@@ -940,20 +1141,101 @@ void inferenceWorker(int batchSize,
     cudaEventElapsedTime(&final_trt_ms, trtStart[currentSlot], trtStop[currentSlot]);
 
     auto t_drain_post_start = std::chrono::high_resolution_clock::now();
-    std::vector<cv::Mat> finalResults = renderBatch(static_cast<float*>(outputs[currentSlot]), currentBundle);
+    cv::Mat finalMask;
+    int finalTargets = 0;
+    std::vector<cv::Mat> finalResults = renderBatch(static_cast<float*>(outputs[currentSlot]), currentBundle, finalMask, &finalTargets);
     auto t_drain_post_end = std::chrono::high_resolution_clock::now();
     double final_post_ms = std::chrono::duration<double, std::milli>(t_drain_post_end - t_drain_post_start).count();
 
+    // Publish final horizontally combined mask and visualization topics to ROS One node
+    if (maskPub && config.ros.enabled && ros::ok()) {
+        std_msgs::Header header;
+        header.seq = currentBundle.frameId;
+        if (currentBundle.ptpTimeStampNs > 0) {
+            header.stamp.fromNSec(currentBundle.ptpTimeStampNs);
+        } else {
+            header.stamp = ros::Time::now();
+        }
+        header.frame_id = config.ros.frame_id;
+
+        const std::string encoding = config.mask_options.single_channel 
+            ? sensor_msgs::image_encodings::MONO8 
+            : sensor_msgs::image_encodings::BGR8;
+
+        sensor_msgs::ImagePtr msg(new sensor_msgs::Image());
+        msg->header = header;
+        msg->height = finalMask.rows;
+        msg->width = finalMask.cols;
+        msg->encoding = encoding;
+        msg->is_bigendian = false;
+        msg->step = static_cast<sensor_msgs::Image::_step_type>(finalMask.step);
+        const size_t dataSize = finalMask.step * finalMask.rows;
+        msg->data.resize(dataSize);
+        if (!finalMask.empty()) {
+            std::memcpy(msg->data.data(), finalMask.data, dataSize);
+        }
+
+        maskPub->publish(msg);
+
+        if (maskVizPub && maskVizPub->getNumSubscribers() > 0 && !finalMask.empty()) {
+            cv::Mat viz;
+            if (finalMask.channels() == 1) {
+                cv::Mat scaled;
+                finalMask.convertTo(scaled, CV_8UC1, 7.0);
+                cv::applyColorMap(scaled, viz, cv::COLORMAP_JET);
+                viz.setTo(cv::Scalar(0, 0, 0), finalMask == 0);
+            } else {
+                viz = finalMask;
+            }
+
+            sensor_msgs::ImagePtr vizMsg(new sensor_msgs::Image());
+            vizMsg->header = header;
+            vizMsg->height = viz.rows;
+            vizMsg->width = viz.cols;
+            vizMsg->encoding = sensor_msgs::image_encodings::BGR8;
+            vizMsg->is_bigendian = false;
+            vizMsg->step = static_cast<sensor_msgs::Image::_step_type>(viz.step);
+            const size_t vizSize = viz.step * viz.rows;
+            vizMsg->data.resize(vizSize);
+            std::memcpy(vizMsg->data.data(), viz.data, vizSize);
+            maskVizPub->publish(vizMsg);
+        }
+
+        if (detPub && detPub->getNumSubscribers() > 0 && !finalResults.empty()) {
+            cv::Mat combinedDets;
+            cv::hconcat(finalResults, combinedDets);
+
+            sensor_msgs::ImagePtr detMsg(new sensor_msgs::Image());
+            detMsg->header = header;
+            detMsg->height = combinedDets.rows;
+            detMsg->width = combinedDets.cols;
+            detMsg->encoding = sensor_msgs::image_encodings::BGR8;
+            detMsg->is_bigendian = false;
+            detMsg->step = static_cast<sensor_msgs::Image::_step_type>(combinedDets.step);
+            const size_t detSize = combinedDets.step * combinedDets.rows;
+            detMsg->data.resize(detSize);
+            std::memcpy(detMsg->data.data(), combinedDets.data, detSize);
+            detPub->publish(detMsg);
+        }
+
+        ros::spinOnce();
+    }
+
     double final_total_ms = last_pre_ms + final_trt_ms + final_post_ms;
+    double final_trt_fps = (final_trt_ms > 0.0f) ? (1000.0 / final_trt_ms) : 0.0;
+    double final_compute_fps = (final_total_ms > 0.0) ? (1000.0 / final_total_ms) : 0.0;
+    double final_drop = final_trt_fps - final_compute_fps;
+
     auto t_drain_end = t_drain_post_end;
     double final_interval_ms = std::chrono::duration<double, std::milli>(t_drain_end - t_prev_infer).count();
-    double final_fps = (inferCount > 1 && final_interval_ms > 0.0) ? (1000.0 / final_interval_ms) : (1000.0 / final_total_ms);
+    double final_delivery_fps = (inferCount > 1 && final_interval_ms > 0.0) ? (1000.0 / final_interval_ms) : final_compute_fps;
 
     stats.totalFrames++;
     stats.sumPreMs += last_pre_ms;
     stats.sumTrtMs += final_trt_ms;
     stats.sumPostMs += final_post_ms;
     stats.sumTotalMs += final_total_ms;
+    stats.sumTargets += finalTargets;
     stats.endTime = t_drain_end;
 
 #if ENABLE_WEB_SERVER
@@ -961,23 +1243,30 @@ void inferenceWorker(int batchSize,
         WebStats wStats;
         wStats.frameId = currentBundle.frameId;
         wStats.capFps = g_latestCapFps.load();
-        wStats.infFps = final_fps;
+        wStats.infFps = final_delivery_fps;
         wStats.capWorkMs = g_latestCapWorkMs.load();
         wStats.trtMs = final_trt_ms;
         wStats.packetDrops = g_packetDrops.load();
         wStats.numCams = batchSize;
+        wStats.trtFps = final_trt_fps;
+        wStats.postTrackFps = final_compute_fps;
+        wStats.postMs = final_post_ms;
+        wStats.totalTargets = finalTargets;
         webServer->updateFrames(currentBundle.images, finalResults, wStats);
+        webServer->updateMask(finalMask, currentBundle.frameId);
     }
 #endif
 
     {
         std::lock_guard<std::mutex> lock(g_coutMutex);
         std::cout << "[INFERENCE] Frame " << currentBundle.frameId
-                  << " | Pre: " << last_pre_ms << " ms"
-                  << " | TRT: " << final_trt_ms << " ms"
+                  << " | Targets: " << finalTargets
+                  << " | Pre: " << std::fixed << std::setprecision(1) << last_pre_ms << " ms"
+                  << " | TRT: " << final_trt_ms << " ms (" << std::fixed << std::setprecision(1) << final_trt_fps << " FPS)"
                   << " | Post: " << final_post_ms << " ms"
-                  << " | Active: " << final_total_ms << " ms"
-                  << " | Rate: " << final_fps << " FPS"
+                  << " | Post-Track: " << final_compute_fps << " FPS"
+                  << " (Drop: -" << std::fixed << std::setprecision(1) << (final_drop > 0.0 ? final_drop : 0.0) << " FPS)"
+                  << " | Sync: " << final_delivery_fps << " FPS"
                   << std::endl;
     }
 
@@ -993,8 +1282,61 @@ void inferenceWorker(int batchSize,
 
 
 
-int main() {
-    std::string engineFilePath = "/media/swdep/500GB_SSD_PERCEP/black_magic/yolov10x_dynamic_fp32.engine";
+int main(int argc, char** argv) {
+    std::string configPath = "config.yaml";
+    if (argc > 1 && argv[1][0] != '-') {
+        configPath = argv[1];
+    } else {
+        std::ifstream checkConfig(configPath);
+        if (!checkConfig.good()) {
+            std::ifstream checkSub("config/config.yaml");
+            if (checkSub.good()) {
+                configPath = "config/config.yaml";
+            }
+        }
+    }
+
+    PipelineConfig config = PipelineConfig::loadFromFile(configPath);
+
+    // Initialize ROS One (ROS 1)
+    if (config.ros.enabled) {
+        ros::init(argc, argv, config.ros.node_name, ros::init_options::NoSigintHandler);
+    }
+
+    std::unique_ptr<ros::NodeHandle> nh;
+    std::unique_ptr<ros::Publisher> maskPub;
+    std::unique_ptr<ros::Publisher> maskVizPub;
+    std::unique_ptr<ros::Publisher> detPub;
+    if (config.ros.enabled) {
+        if (ros::master::check()) {
+            nh = std::unique_ptr<ros::NodeHandle>(new ros::NodeHandle());
+            ros::NodeHandle pnh("~");
+            pnh.param("engine_file", config.engine_file, config.engine_file);
+            pnh.param("mask_topic", config.ros.mask_topic, config.ros.mask_topic);
+            pnh.param("frame_id", config.ros.frame_id, config.ros.frame_id);
+
+            maskPub = std::unique_ptr<ros::Publisher>(new ros::Publisher(
+                nh->advertise<sensor_msgs::Image>(config.ros.mask_topic, config.ros.queue_size)));
+            maskVizPub = std::unique_ptr<ros::Publisher>(new ros::Publisher(
+                nh->advertise<sensor_msgs::Image>(config.ros.mask_topic + "/viz", 2)));
+            detPub = std::unique_ptr<ros::Publisher>(new ros::Publisher(
+                nh->advertise<sensor_msgs::Image>("/camera_array/detections", 2)));
+
+            std::cout << "[ROS 1] Node initialized ('" << config.ros.node_name 
+                      << "'). Connected to master!\n"
+                      << "        Mask Topic (raw mono8):       " << config.ros.mask_topic << "\n"
+                      << "        Mask Topic (colorized RViz):  " << config.ros.mask_topic << "/viz\n"
+                      << "        Detections Topic (RViz view): /camera_array/detections" << std::endl;
+        } else {
+            std::cout << "[ROS 1 INFO] ROS master (roscore) not detected at startup. "
+                      << "Pipeline will run normally and connect to ROS once roscore is active.\n"
+                      << "        Configured Mask Topic: " << config.ros.mask_topic << std::endl;
+        }
+    }
+
+    config.printSummary();
+
+    std::string engineFilePath = config.engine_file;
 
     std::ifstream engineFile(engineFilePath, std::ios::binary | std::ios::ate);
     if (!engineFile) {
@@ -1026,16 +1368,56 @@ int main() {
         arSystem = Arena::OpenSystem();
         
         arSystem->UpdateDevices(100);
-        std::vector<Arena::DeviceInfo> cameras = arSystem->GetDevices();
+        std::vector<Arena::DeviceInfo> detectedCameras = arSystem->GetDevices();
 
-        if (cameras.empty()) {
+        if (detectedCameras.empty()) {
             std::cout << "No LUCID camera found!!!!" << std::endl;
             Arena::CloseSystem(arSystem);
             return -1;
         }
 
-        int numCams = cameras.size();
-        std::cout << "Found: " << numCams << " number of cameras.\n";
+        std::cout << "Found: " << detectedCameras.size() << " connected LUCID camera(s) on network:\n";
+        for (size_t i = 0; i < detectedCameras.size(); ++i) {
+            std::cout << "  - Serial: " << detectedCameras[i].SerialNumber().c_str() 
+                      << " (" << detectedCameras[i].ModelName().c_str() << ")\n";
+        }
+
+        // Map connected cameras by serial number
+        std::map<std::string, size_t> serialToIndex;
+        for (size_t i = 0; i < detectedCameras.size(); ++i) {
+            serialToIndex[detectedCameras[i].SerialNumber().c_str()] = i;
+        }
+
+        // Order cameras according to config.camera_serials
+        std::vector<Arena::DeviceInfo> orderedCameras;
+        if (!config.camera_serials.empty()) {
+            for (const auto& serial : config.camera_serials) {
+                auto it = serialToIndex.find(serial);
+                if (it != serialToIndex.end()) {
+                    orderedCameras.push_back(detectedCameras[it->second]);
+                    serialToIndex.erase(it);
+                } else {
+                    std::cerr << "[CONFIG WARN] Camera serial '" << serial 
+                              << "' from config is NOT connected!\n";
+                }
+            }
+        }
+
+        if (orderedCameras.empty()) {
+            std::cout << "[CONFIG WARN] No configured serials matched! Using all detected cameras in enumeration order.\n";
+            orderedCameras = detectedCameras;
+        } else if (!serialToIndex.empty()) {
+            std::cout << "[CONFIG NOTE] " << serialToIndex.size() 
+                      << " connected camera(s) not listed in config will not be used in this run.\n";
+        }
+
+        int numCams = orderedCameras.size();
+        std::cout << "[PIPELINE] Active camera order for horizontal mask (" << numCams << " cameras):\n";
+        for (int i = 0; i < numCams; ++i) {
+            std::cout << "  [" << i << "] Serial: " << orderedCameras[i].SerialNumber().c_str()
+                      << " | Model: " << orderedCameras[i].ModelName().c_str()
+                      << " | Mask H-Slice: [" << i * 1920 << " .. " << (i + 1) * 1920 << " px)\n";
+        }
 
         // ==============================================================
         // DYNAMIC BATCH SIZING BASED ON CONNECTED CAMERAS
@@ -1096,15 +1478,15 @@ int main() {
         uint32_t swapRBMask = 0;
 
         for (int i = 0; i < numCams; i++) {
-            arDevice[i] = arSystem->CreateDevice(cameras[i]);
+            arDevice[i] = arSystem->CreateDevice(orderedCameras[i]);
             arNodeMap[i] = arDevice[i]->GetNodeMap();
             auto* arStreamNodeMap = arDevice[i]->GetTLStreamNodeMap();
 
             //configuring each camera
 
             //pixel formatting
-            const std::string serial = cameras[i].SerialNumber().c_str();
-            const bool rotate180 = kRotate180Serials.count(serial) > 0;
+            const std::string serial = orderedCameras[i].SerialNumber().c_str();
+            const bool rotate180 = config.rotate_180_serials.count(serial) > 0;
 
             // 1. Clear any flip left over from a previous run
             Arena::SetNodeValue<bool>(arNodeMap[i], "ReverseX", false);
@@ -1213,9 +1595,20 @@ int main() {
         InferenceStats infStats;
 
 #if ENABLE_WEB_SERVER
-        MJPEGWebServer webServer(8080);
-        if (!webServer.start()) {
-            std::cerr << "[WARN] Failed to start Web Server on port 8080\n";
+        MJPEGWebServer webServer(config.web_server.port);
+        std::vector<CameraDetail> camDetails(numCams);
+        for (int i = 0; i < numCams; ++i) {
+            camDetails[i].index = i;
+            camDetails[i].serial = orderedCameras[i].SerialNumber().c_str();
+            camDetails[i].model = orderedCameras[i].ModelName().c_str();
+            camDetails[i].ip = orderedCameras[i].IpAddressStr().c_str();
+        }
+        webServer.setCameraDetails(camDetails);
+
+        if (config.web_server.enabled) {
+            if (!webServer.start()) {
+                std::cerr << "[WARN] Failed to start Web Server on port " << config.web_server.port << "\n";
+            }
         }
 #endif
 
@@ -1244,9 +1637,13 @@ int main() {
                                   std::ref(frameQueue),
                                   std::ref(infStats),
                                   std::ref(info),
-                                  swapRBMask
+                                  swapRBMask,
+                                  config,
+                                  maskPub.get(),
+                                  maskVizPub.get(),
+                                  detPub.get()
 #if ENABLE_WEB_SERVER
-                                  , &webServer
+                                  , config.web_server.enabled ? &webServer : nullptr
 #endif
         );
 
@@ -1256,7 +1653,9 @@ int main() {
         g_queuePtr = nullptr;
 
 #if ENABLE_WEB_SERVER
-        webServer.stop();
+        if (config.web_server.enabled) {
+            webServer.stop();
+        }
 #endif
 
         std::cout << "\n[PIPELINE] Both threads terminated. Releasing resources...\n";
@@ -1288,18 +1687,25 @@ int main() {
             double avgTrtMs = infStats.sumTrtMs / infStats.totalFrames;
             double avgPostMs = infStats.sumPostMs / infStats.totalFrames;
             double avgTotalMs = infStats.sumTotalMs / infStats.totalFrames;
+            double avgTargets = static_cast<double>(infStats.sumTargets) / infStats.totalFrames;
+            double rawTrtFps = avgTrtMs > 0.0 ? (1000.0 / avgTrtMs) : 0.0;
+            double postTrackFps = avgTotalMs > 0.0 ? (1000.0 / avgTotalMs) : 0.0;
+            double avgDropFps = rawTrtFps - postTrackFps;
 
             std::cout << "[INFERENCE SUMMARY]:\n"
-                      << "  Total Batches Inferred : " << infStats.totalFrames << "\n"
-                      << "  Total Images Processed : " << infStats.totalFrames * batchSize << " (Batch Size: " << batchSize << ")\n"
-                      << "  Avg Preprocessing Time : " << avgPreMs << " ms\n"
-                      << "  Avg TensorRT GPU Time  : " << avgTrtMs << " ms (hardware execution via cudaEvent)\n"
-                      << "  Avg Post/Tracking Time : " << avgPostMs << " ms\n"
-                      << "  Avg Active Frame Work  : " << avgTotalMs << " ms\n"
-                      << "  Avg Pipeline Delivery  : " << avgInfRate << " FPS per camera\n"
-                      << "  Avg Pipeline Throughput: " << avgInfRate * batchSize << " images/sec\n"
-                      << "  Max Engine Throughput  : " << (avgTrtMs > 0 ? (1000.0 / avgTrtMs) : 0) << " batches/sec ("
-                      << (avgTrtMs > 0 ? (1000.0 / avgTrtMs) * batchSize : 0) << " images/sec)\n";
+                      << "  Total Batches Inferred   : " << infStats.totalFrames << "\n"
+                      << "  Total Images Processed   : " << infStats.totalFrames * batchSize << " (Batch Size: " << batchSize << ")\n"
+                      << "  Avg Tracked Targets/Frame: " << std::fixed << std::setprecision(1) << avgTargets << " targets\n"
+                      << "  Avg Preprocessing Time   : " << avgPreMs << " ms\n"
+                      << "  Avg TensorRT GPU Time    : " << avgTrtMs << " ms (hardware execution via cudaEvent)\n"
+                      << "  Avg Post/Tracking Time   : " << avgPostMs << " ms\n"
+                      << "  Avg Active Frame Work    : " << avgTotalMs << " ms\n"
+                      << "  Raw Engine Throughput    : " << rawTrtFps << " FPS (" << rawTrtFps * batchSize << " images/sec)\n"
+                      << "  Post-Track Compute FPS   : " << postTrackFps << " FPS (" << postTrackFps * batchSize << " images/sec)\n"
+                      << "  Tracking & Post FPS Drop : -" << (avgDropFps > 0 ? avgDropFps : 0.0) << " FPS ("
+                      << (rawTrtFps > 0 ? (avgDropFps / rawTrtFps * 100.0) : 0.0) << " %)\n"
+                      << "  Pipeline Delivery Rate   : " << avgInfRate << " FPS (camera synchronized)\n"
+                      << "  Pipeline Ingestion Rate  : " << avgInfRate * batchSize << " images/sec\n";
         } else {
             std::cout << "[INFERENCE SUMMARY]: Not enough frames inferred to compute average.\n";
         }

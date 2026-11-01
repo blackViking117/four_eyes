@@ -37,7 +37,7 @@ enum class MaskMode {
 
 struct MaskOptions {
     MaskMode mode          = MaskMode::BBOX;   // default = original behaviour
-    bool     single_channel = false;          // CV_8UC1 instead of CV_8UC3 (3x smaller)
+    bool     single_channel = true;           // CV_8UC1 instead of CV_8UC3 (3x smaller)
     int      min_box_px    = 8;                // boxes smaller than this -> bbox fill
     float    min_shape_fill = 0.20f;           // if fitted shape area < this*bbox area,
                                                // distrust it and fall back to bbox
@@ -192,7 +192,7 @@ inline void prepareMask(cv::Mat& mask, const cv::Size& sz, bool single_channel) 
 
 // struct MaskOptions {
 //     MaskMode mode          = MaskMode::BBOX;   // default = original behaviour
-//     bool     single_channel = false;          // CV_8UC1 instead of CV_8UC3 (3x smaller)
+//     bool     single_channel = true;           // CV_8UC1 instead of CV_8UC3 (3x smaller)
 //     int      min_box_px    = 8;                // boxes smaller than this -> bbox fill
 //     float    min_shape_fill = 0.20f;           // if fitted shape area < this*bbox area,
 //                                                // distrust it and fall back to bbox
