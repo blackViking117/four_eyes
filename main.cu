@@ -22,6 +22,9 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <cerrno>
 
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
@@ -48,9 +51,7 @@
 
 // ==============================================================================
 // 2D MULTI-OBJECT TRACKING (ByteTrack-style, per camera, see include/byte_tracker.hpp)
-// Set to 1 to track detections across frames and draw "ID:n class score" overlays
-// (confirmed tracks only, detections >= tracker low_thresh feed the tracker)
-// Set to 0 for the original behaviour: raw detections >= 0.45 drawn with no IDs
+// Runtime tracking is controlled via config.yaml (tracking.enabled: true / false).
 // ==============================================================================
 #define ENABLE_TRACKING 1
 
@@ -163,6 +164,93 @@ public:
 
     void wakeUpAll() {
         m_cv.notify_all();
+    }
+};
+
+// Container for frames, detections, and masks to be saved to disk
+struct SavedFrameBundle {
+    enum Type { PRE_CAPTURE, INFERENCE_RESULT } type = PRE_CAPTURE;
+    int frameId = 0;
+    int64_t ptpTimeStampNs = 0;
+    std::vector<std::string> cameraSerials;
+    uint32_t swapRBMask = 0;
+
+    // For PRE_CAPTURE (from captureWorker directly at full camera rate):
+    std::vector<cv::Mat> rawBayerImages;
+
+    // For INFERENCE_RESULT (from inferenceWorker):
+    std::vector<cv::Mat> detectionImages;  // images with bounding box overlays
+    std::vector<cv::Mat> maskImages;       // individual camera masks
+    cv::Mat combinedMask;                  // horizontal combined mask
+};
+
+struct SaveStats {
+    int totalBundlesSaved = 0;
+    int totalImagesSaved = 0;
+    double totalSaveTimeMs = 0.0;
+};
+
+class ThreadSafeSaveQueue {
+private:
+    std::queue<SavedFrameBundle> m_queue;
+    std::mutex m_mutex;
+    std::condition_variable m_cvNotEmpty;
+    std::condition_variable m_cvNotFull;
+    size_t m_maxCapacity;
+    std::atomic<bool> m_shutdown{false};
+    std::atomic<uint64_t> m_droppedCount{0};
+
+public:
+    explicit ThreadSafeSaveQueue(size_t maxCapacity = 500) : m_maxCapacity(maxCapacity) {}
+
+    bool push(SavedFrameBundle bundle, int waitMs = 20) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_maxCapacity > 0 && m_queue.size() >= m_maxCapacity) {
+            m_cvNotFull.wait_for(lock, std::chrono::milliseconds(waitMs), [this] {
+                return m_queue.size() < m_maxCapacity || m_shutdown.load();
+            });
+        }
+        if (m_shutdown.load()) return false;
+        if (m_maxCapacity > 0 && m_queue.size() >= m_maxCapacity) {
+            m_queue.pop();
+            m_droppedCount++;
+            std::cerr << "[FRAME SAVER WARN] Queue full (" << m_maxCapacity 
+                      << ")! Dropped oldest bundle. Total dropped: " << m_droppedCount.load() << "\n";
+        }
+        m_queue.push(std::move(bundle));
+        m_cvNotEmpty.notify_one();
+        return true;
+    }
+
+    bool pop(SavedFrameBundle& bundle, const std::atomic<bool>& running) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cvNotEmpty.wait(lock, [this, &running] {
+            return !m_queue.empty() || (!running.load() && m_queue.empty()) || m_shutdown.load();
+        });
+
+        if (m_queue.empty()) {
+            return false;
+        }
+
+        bundle = std::move(m_queue.front());
+        m_queue.pop();
+        m_cvNotFull.notify_one();
+        return true;
+    }
+
+    void shutdown() {
+        m_shutdown.store(true);
+        m_cvNotEmpty.notify_all();
+        m_cvNotFull.notify_all();
+    }
+
+    size_t size() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.size();
+    }
+
+    uint64_t getDroppedCount() const {
+        return m_droppedCount.load();
     }
 };
 
@@ -443,7 +531,8 @@ std::vector<cv::Mat> drawDetections(const float* output,
                                     const MaskOptions& maskOpt,
                                     int numDets = 300,
                                     float confThresh = 0.45f,
-                                    int* outTotalDets = nullptr)
+                                    int* outTotalDets = nullptr,
+                                    std::vector<cv::Mat>* outPreImages = nullptr)
 {
     if (outTotalDets) *outTotalDets = 0;
     const int stride = 6;  // x1, y1, x2, y2, score, class
@@ -461,6 +550,9 @@ std::vector<cv::Mat> drawDetections(const float* output,
         // OpenCV's Bayer names are shifted vs GenICam: camera RGGB -> BayerBG, camera BGGR -> BayerRG
         const int bayerCode = ((swapRBMask >> b) & 1u) ? cv::COLOR_BayerRG2BGR : cv::COLOR_BayerBG2BGR;
         cv::cvtColor(bayerImages[b], drawn[b], bayerCode);
+        if (outPreImages && b < static_cast<int>(outPreImages->size())) {
+            (*outPreImages)[b] = drawn[b].clone();
+        }
 
         // Sub-region ROI in combinedMask for camera b (horizontal layout: [b*W .. (b+1)*W))
         cv::Mat subMask = combinedMask(cv::Rect(b * W, 0, W, H));
@@ -524,7 +616,6 @@ std::vector<cv::Mat> drawDetections(const float* output,
     return drawn;
 }
 
-#if ENABLE_TRACKING
 // Tracking variant of drawDetections(): decodes the raw YOLOv10 output into original-image boxes,
 // advances the per-camera ByteTrack by one frame, then draws confirmed tracks on display images
 // and paints each detected object into the combined horizontal mask using the mask codec.
@@ -538,7 +629,8 @@ std::vector<cv::Mat> trackAndDraw(const float* output,
                                   cv::Mat& combinedMask,
                                   const MaskOptions& maskOpt,
                                   int numDets = 300,
-                                  int* outTotalTracks = nullptr)
+                                  int* outTotalTracks = nullptr,
+                                  std::vector<cv::Mat>* outPreImages = nullptr)
 {
     if (outTotalTracks) *outTotalTracks = 0;
     const int stride = 6;  // x1, y1, x2, y2, score, class
@@ -584,6 +676,9 @@ std::vector<cv::Mat> trackAndDraw(const float* output,
         // 3. Debayer for display (OpenCV's Bayer names are shifted vs GenICam, see drawDetections)
         const int bayerCode = ((swapRBMask >> b) & 1u) ? cv::COLOR_BayerRG2BGR : cv::COLOR_BayerBG2BGR;
         cv::cvtColor(bayerImages[b], drawn[b], bayerCode);
+        if (outPreImages && b < static_cast<int>(outPreImages->size())) {
+            (*outPreImages)[b] = drawn[b].clone();
+        }
 
         // 4. Sub-region ROI in combinedMask for camera b (horizontal layout: [b*W .. (b+1)*W))
         cv::Mat subMask = combinedMask(cv::Rect(b * W, 0, W, H));
@@ -636,7 +731,6 @@ std::vector<cv::Mat> trackAndDraw(const float* output,
     }
     return drawn;
 }
-#endif
 
 
 bool preProcessChecker(float* preProcessCPU, float* preProcessorGPU) {
@@ -652,6 +746,7 @@ bool preProcessChecker(float* preProcessCPU, float* preProcessorGPU) {
 }
 
 ThreadSafeQueue* g_queuePtr = nullptr;
+ThreadSafeSaveQueue* g_saveQueuePtr = nullptr;
 std::mutex g_coutMutex; // Mutex to prevent capture and inference logs from interleaving
 
 void sigintHandler(int) {
@@ -659,9 +754,128 @@ void sigintHandler(int) {
     if (g_queuePtr) {
         g_queuePtr->wakeUpAll();
     }
+    if (g_saveQueuePtr) {
+        g_saveQueuePtr->shutdown();
+    }
     if (ros::isInitialized()) {
         ros::shutdown();
     }
+}
+
+static bool createDirectoryRecursive(const std::string& path) {
+    if (path.empty()) return false;
+    std::string current;
+    for (size_t i = 0; i < path.size(); ++i) {
+        current += path[i];
+        if (path[i] == '/' || i == path.size() - 1) {
+            struct stat st;
+            if (stat(current.c_str(), &st) != 0) {
+                if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+void saveWorker(ThreadSafeSaveQueue& saveQueue,
+                const PipelineConfig& config,
+                SaveStats& stats) {
+    std::cout << "[Frame Saver Worker] Started on thread: " << std::this_thread::get_id() << std::endl;
+    const std::string baseDir = config.save_frames.directory;
+    const std::string preDir = baseDir + "/pre";
+    const std::string detDir = baseDir + "/detection";
+    const std::string maskDir = baseDir + "/mask";
+
+    createDirectoryRecursive(baseDir);
+    if (config.save_frames.save_pre_inference) createDirectoryRecursive(preDir);
+    if (config.save_frames.save_detections)    createDirectoryRecursive(detDir);
+    if (config.save_frames.save_masks || config.save_frames.save_combined_mask) createDirectoryRecursive(maskDir);
+
+    const std::string imgExt = config.save_frames.format_images.empty() ? "jpg" : config.save_frames.format_images;
+    const std::vector<int> jpgParams = {cv::IMWRITE_JPEG_QUALITY, config.save_frames.jpeg_quality};
+    const std::vector<int> pngParams = {cv::IMWRITE_PNG_COMPRESSION, 1}; // Fast lossless PNG
+
+    SavedFrameBundle bundle;
+    while (saveQueue.pop(bundle, g_running)) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        int imagesSavedInBundle = 0;
+        char filename[512];
+
+        if (bundle.type == SavedFrameBundle::PRE_CAPTURE) {
+            // 1. Pre-inference camera images directly captured from captureWorker
+            if (config.save_frames.save_pre_inference) {
+                for (size_t c = 0; c < bundle.rawBayerImages.size(); ++c) {
+                    if (bundle.rawBayerImages[c].empty()) continue;
+                    // Debayer from raw Bayer to BGR using the camera's bayer format
+                    const int bayerCode = ((bundle.swapRBMask >> c) & 1u) ? cv::COLOR_BayerRG2BGR : cv::COLOR_BayerBG2BGR;
+                    cv::Mat bgr;
+                    cv::cvtColor(bundle.rawBayerImages[c], bgr, bayerCode);
+
+                    std::string serial = (c < bundle.cameraSerials.size()) ? bundle.cameraSerials[c] : "cam";
+                    std::snprintf(filename, sizeof(filename), "%s/frame_%06d_cam%d_%s_pre.%s",
+                                  preDir.c_str(), bundle.frameId, (int)c, serial.c_str(), imgExt.c_str());
+                    if (imgExt == "png") {
+                        cv::imwrite(filename, bgr, pngParams);
+                    } else {
+                        cv::imwrite(filename, bgr, jpgParams);
+                    }
+                    imagesSavedInBundle++;
+                }
+            }
+        } else if (bundle.type == SavedFrameBundle::INFERENCE_RESULT) {
+            // 2. Detection images with overlays from inferenceWorker
+            if (config.save_frames.save_detections) {
+                for (size_t c = 0; c < bundle.detectionImages.size(); ++c) {
+                    if (bundle.detectionImages[c].empty()) continue;
+                    std::string serial = (c < bundle.cameraSerials.size()) ? bundle.cameraSerials[c] : "cam";
+                    std::snprintf(filename, sizeof(filename), "%s/frame_%06d_cam%d_%s_det.%s",
+                                  detDir.c_str(), bundle.frameId, (int)c, serial.c_str(), imgExt.c_str());
+                    if (imgExt == "png") {
+                        cv::imwrite(filename, bundle.detectionImages[c], pngParams);
+                    } else {
+                        cv::imwrite(filename, bundle.detectionImages[c], jpgParams);
+                    }
+                    imagesSavedInBundle++;
+                }
+            }
+
+            // 3. Masks (Individual camera masks and horizontal combined mask)
+            if (config.save_frames.save_masks) {
+                for (size_t c = 0; c < bundle.maskImages.size(); ++c) {
+                    if (bundle.maskImages[c].empty()) continue;
+                    std::string serial = (c < bundle.cameraSerials.size()) ? bundle.cameraSerials[c] : "cam";
+                    std::snprintf(filename, sizeof(filename), "%s/frame_%06d_cam%d_%s_mask.png",
+                                  maskDir.c_str(), bundle.frameId, (int)c, serial.c_str());
+                    cv::imwrite(filename, bundle.maskImages[c], pngParams);
+                    imagesSavedInBundle++;
+                }
+            }
+
+            if (config.save_frames.save_combined_mask && !bundle.combinedMask.empty()) {
+                std::snprintf(filename, sizeof(filename), "%s/frame_%06d_combined_mask.png",
+                              maskDir.c_str(), bundle.frameId);
+                cv::imwrite(filename, bundle.combinedMask, pngParams);
+                imagesSavedInBundle++;
+            }
+        }
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double durMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        stats.totalBundlesSaved++;
+        stats.totalImagesSaved += imagesSavedInBundle;
+        stats.totalSaveTimeMs += durMs;
+
+        if (stats.totalBundlesSaved % 50 == 0) {
+            std::cout << "[FRAME SAVER] Saved " << stats.totalBundlesSaved << " frame bundles ("
+                      << stats.totalImagesSaved << " files) to " << baseDir 
+                      << " (queue size: " << saveQueue.size() << ")\n" << std::flush;
+        }
+    }
+
+    std::cout << "[Frame Saver Worker] Stopped. Drained all items. Total saved: "
+              << stats.totalBundlesSaved << " bundles (" << stats.totalImagesSaved << " files).\n";
 }
 
 
@@ -720,7 +934,10 @@ void triggerWorker(GenApi::INodeMap* arSystemTL,
 void captureWorker(int numCams,
                    const std::vector<Arena::IDevice*>& arDevice,
                    ThreadSafeQueue& queue,
-                   CaptureStats& stats) {
+                   CaptureStats& stats,
+                   ThreadSafeSaveQueue* saveQueue = nullptr,
+                   const PipelineConfig* config = nullptr,
+                   uint32_t swapRBMask = 0) {
     int frameCounter = 0;
     std::cout << "[Capture Worker] Started on thread: " << std::this_thread::get_id() << std::endl;
 
@@ -770,6 +987,21 @@ void captureWorker(int numCams,
 
         if (!fetchSuccess) {
             continue;
+        }
+
+        // Push pre-inference frames directly from captureWorker so 100% of camera frames are saved
+        if (saveQueue && config && config->save_frames.enabled && config->save_frames.save_pre_inference) {
+            SavedFrameBundle preBundle;
+            preBundle.type = SavedFrameBundle::PRE_CAPTURE;
+            preBundle.frameId = bundle.frameId;
+            preBundle.ptpTimeStampNs = bundle.ptpTimeStampNs;
+            preBundle.cameraSerials = config->camera_serials;
+            preBundle.swapRBMask = swapRBMask;
+            preBundle.rawBayerImages.resize(numCams);
+            for (int i = 0; i < numCams; i++) {
+                preBundle.rawBayerImages[i] = bundle.images[i].clone();
+            }
+            saveQueue->push(std::move(preBundle));
         }
 
         auto t_cap_end = std::chrono::high_resolution_clock::now();
@@ -822,6 +1054,7 @@ void inferenceWorker(int batchSize,
 #if ENABLE_WEB_SERVER
                      , MJPEGWebServer* webServer = nullptr
 #endif
+                     , ThreadSafeSaveQueue* saveQueue = nullptr
 ) {
     std::cout << "[Inference Worker] Started on thread: " << std::this_thread::get_id() << std::endl;
  
@@ -833,24 +1066,24 @@ void inferenceWorker(int batchSize,
     BayerLetterboxParams lp = makeBayerLetterboxParams(info.origWid, info.origHeig, NET_W, NET_H);
     lp.swapRBMask = swapRBMask;   // cameras that deliver BGGR (flipped 180 deg) get R/B swapped in the kernel
 
-#if ENABLE_TRACKING
-    // One tracker for the whole rig: independent track lists per camera, IDs unique across cameras.
-    // Defaults match the ROS node. Tune here (e.g. trackerCfg.label_max to keep only the classes you
-    // care about, trackerCfg.max_age / confirm_hits, which are counted in processed frames).
-    tracker2d::Tracker2DConfig trackerCfg;
-    tracker2d::MultiCamByteTracker tracker(batchSize, trackerCfg);
+    // One tracker for the whole rig if enabled in config: independent track lists per camera,
+    // IDs unique across cameras. If tracking is disabled, tracker is bypassed completely.
+    std::unique_ptr<tracker2d::MultiCamByteTracker> tracker;
     std::vector<tracker2d::Detection> trackDets;   // scratch for the decoded detections
-    trackDets.reserve(300);
-#endif
+    if (config.tracking.enabled) {
+        tracker2d::Tracker2DConfig trackerCfg;
+        tracker = std::make_unique<tracker2d::MultiCamByteTracker>(batchSize, trackerCfg);
+        trackDets.reserve(300);
+    }
 
     // Overlay for one finished batch: tracked boxes with IDs (tracking on) or raw detections (off),
     // and paints each detected object into combinedMask according to the mono8 mask codec
-    auto renderBatch = [&](const float* out, const FrameBundle& bundle, cv::Mat& combinedMask, int* outTargets = nullptr) {
-#if ENABLE_TRACKING
-        return trackAndDraw(out, batchSize, bundle.images, info, swapRBMask, tracker, trackDets, combinedMask, config.mask_options, 300, outTargets);
-#else
-        return drawDetections(out, batchSize, bundle.images, info, swapRBMask, combinedMask, config.mask_options, 300, config.confidence_threshold, outTargets);
-#endif
+    auto renderBatch = [&](const float* out, const FrameBundle& bundle, cv::Mat& combinedMask, int* outTargets = nullptr, std::vector<cv::Mat>* outPreImages = nullptr) {
+        if (config.tracking.enabled && tracker) {
+            return trackAndDraw(out, batchSize, bundle.images, info, swapRBMask, *tracker, trackDets, combinedMask, config.mask_options, 300, outTargets, outPreImages);
+        } else {
+            return drawDetections(out, batchSize, bundle.images, info, swapRBMask, combinedMask, config.mask_options, 300, config.confidence_threshold, outTargets, outPreImages);
+        }
     };
  
     // Raw Bayer staging: CPU writes rawPinned -> H2D copy -> rawDev -> kernel reads rawDev.
@@ -964,6 +1197,39 @@ void inferenceWorker(int batchSize,
         std::vector<cv::Mat> results = renderBatch(static_cast<float*>(outputs[currentSlot]), currentBundle, combinedMask, &numTargets);
         auto t_post_end = std::chrono::high_resolution_clock::now();
         double post_ms = std::chrono::duration<double, std::milli>(t_post_end - t_post_start).count();
+
+        // 5a. Push detection and mask results to save queue if enabled
+        if (config.save_frames.enabled && saveQueue &&
+            (config.save_frames.save_detections || config.save_frames.save_masks || config.save_frames.save_combined_mask)) {
+            SavedFrameBundle saveBundle;
+            saveBundle.type = SavedFrameBundle::INFERENCE_RESULT;
+            saveBundle.frameId = currentBundle.frameId;
+            saveBundle.ptpTimeStampNs = currentBundle.ptpTimeStampNs;
+            saveBundle.cameraSerials = config.camera_serials;
+
+            if (config.save_frames.save_detections) {
+                saveBundle.detectionImages.resize(results.size());
+                for (size_t i = 0; i < results.size(); ++i) {
+                    saveBundle.detectionImages[i] = results[i].clone();
+                }
+            }
+
+            if (config.save_frames.save_masks) {
+                saveBundle.maskImages.resize(batchSize);
+                for (int b = 0; b < batchSize; ++b) {
+                    int x = b * info.origWid;
+                    if (x + info.origWid <= combinedMask.cols) {
+                        saveBundle.maskImages[b] = combinedMask(cv::Rect(x, 0, info.origWid, info.origHeig)).clone();
+                    }
+                }
+            }
+
+            if (config.save_frames.save_combined_mask) {
+                saveBundle.combinedMask = combinedMask.clone();
+            }
+
+            saveQueue->push(std::move(saveBundle));
+        }
 
         // 5b. Publish horizontally combined mask and visualization topics to ROS One node
         if (config.ros.enabled && ros::ok()) {
@@ -1146,6 +1412,38 @@ void inferenceWorker(int batchSize,
     std::vector<cv::Mat> finalResults = renderBatch(static_cast<float*>(outputs[currentSlot]), currentBundle, finalMask, &finalTargets);
     auto t_drain_post_end = std::chrono::high_resolution_clock::now();
     double final_post_ms = std::chrono::duration<double, std::milli>(t_drain_post_end - t_drain_post_start).count();
+
+    if (config.save_frames.enabled && saveQueue &&
+        (config.save_frames.save_detections || config.save_frames.save_masks || config.save_frames.save_combined_mask)) {
+        SavedFrameBundle saveBundle;
+        saveBundle.type = SavedFrameBundle::INFERENCE_RESULT;
+        saveBundle.frameId = currentBundle.frameId;
+        saveBundle.ptpTimeStampNs = currentBundle.ptpTimeStampNs;
+        saveBundle.cameraSerials = config.camera_serials;
+
+        if (config.save_frames.save_detections) {
+            saveBundle.detectionImages.resize(finalResults.size());
+            for (size_t i = 0; i < finalResults.size(); ++i) {
+                saveBundle.detectionImages[i] = finalResults[i].clone();
+            }
+        }
+
+        if (config.save_frames.save_masks) {
+            saveBundle.maskImages.resize(batchSize);
+            for (int b = 0; b < batchSize; ++b) {
+                int x = b * info.origWid;
+                if (x + info.origWid <= finalMask.cols) {
+                    saveBundle.maskImages[b] = finalMask(cv::Rect(x, 0, info.origWid, info.origHeig)).clone();
+                }
+            }
+        }
+
+        if (config.save_frames.save_combined_mask) {
+            saveBundle.combinedMask = finalMask.clone();
+        }
+
+        saveQueue->push(std::move(saveBundle));
+    }
 
     // Publish final horizontally combined mask and visualization topics to ROS One node
     if (maskPub && config.ros.enabled && ros::ok()) {
@@ -1499,10 +1797,16 @@ int main(int argc, char** argv) {
             Arena::SetNodeValue<bool>(arNodeMap[i], "ReverseX", rotate180);
             Arena::SetNodeValue<bool>(arNodeMap[i], "ReverseY", rotate180);
 
+            const CameraSetting camCfg = config.getCameraSetting(serial);
+
             GenICam::gcstring pf = Arena::GetNodeValue<GenICam::gcstring>(arNodeMap[i], "PixelFormat");
             std::cout << "  Camera [" << i << "] " << serial
-                    << " | rotate180=" << rotate180
-                    << " | PixelFormat=" << pf << "\n" << std::flush;
+                      << " | rotate180=" << rotate180
+                      << " | PixelFormat=" << pf
+                      << " | ExpAuto=" << camCfg.exposure_auto
+                      << " | ExpTime=" << camCfg.exposure_time << " us"
+                      << " | GainAuto=" << camCfg.gain_auto
+                      << " | Gain=" << camCfg.gain << " dB\n" << std::flush;
 
             if (pf == "BayerBG8") {
                 swapRBMask |= (1u << i);
@@ -1511,11 +1815,34 @@ int main(int argc, char** argv) {
                           << " - kernel only handles BayerRG8 / BayerBG8\n";
             }
 
-            //exposure set to equal time for each camera
-            Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "ExposureAuto", "Off");
-            Arena::SetNodeValue<double>(arNodeMap[i], "ExposureTime", 20000.0);
-            Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "GainAuto", "Off");
-            Arena::SetNodeValue<double>(arNodeMap[i], "Gain", 10.0);
+            // Exposure & Gain configuration from config.yaml
+            try {
+                Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "ExposureAuto", camCfg.exposure_auto.c_str());
+            } catch (const std::exception& e) {
+                std::cerr << "[WARN] Camera " << serial << " could not set ExposureAuto=" << camCfg.exposure_auto << ": " << e.what() << "\n";
+            }
+
+            if (camCfg.exposure_auto == "Off") {
+                try {
+                    Arena::SetNodeValue<double>(arNodeMap[i], "ExposureTime", camCfg.exposure_time);
+                } catch (const std::exception& e) {
+                    std::cerr << "[WARN] Camera " << serial << " could not set ExposureTime=" << camCfg.exposure_time << ": " << e.what() << "\n";
+                }
+            }
+
+            try {
+                Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "GainAuto", camCfg.gain_auto.c_str());
+            } catch (const std::exception& e) {
+                std::cerr << "[WARN] Camera " << serial << " could not set GainAuto=" << camCfg.gain_auto << ": " << e.what() << "\n";
+            }
+
+            if (camCfg.gain_auto == "Off") {
+                try {
+                    Arena::SetNodeValue<double>(arNodeMap[i], "Gain", camCfg.gain);
+                } catch (const std::exception& e) {
+                    std::cerr << "[WARN] Camera " << serial << " could not set Gain=" << camCfg.gain << ": " << e.what() << "\n";
+                }
+            }
 
             //Trigger configuration
             Arena::SetNodeValue<GenICam::gcstring>(arNodeMap[i], "TriggerSelector", "FrameStart");
@@ -1614,6 +1941,19 @@ int main(int argc, char** argv) {
 
         std::cout << "\n[PIPELINE] Launching Trigger (20Hz), Capture, and Inference threads. Press Ctrl+C to stop...\n\n";
 
+        // Optional Frame Saver thread & queue
+        std::unique_ptr<ThreadSafeSaveQueue> saveQueue;
+        std::unique_ptr<std::thread> saveThread;
+        SaveStats saveStats;
+        if (config.save_frames.enabled) {
+            saveQueue = std::make_unique<ThreadSafeSaveQueue>(config.save_frames.max_queue_size);
+            g_saveQueuePtr = saveQueue.get();
+            saveThread = std::make_unique<std::thread>(saveWorker, 
+                                                       std::ref(*saveQueue), 
+                                                       std::cref(config), 
+                                                       std::ref(saveStats));
+        }
+
         // Dedicated high-precision 20.0 Hz PTP Action Command generator
         std::thread triggerThread(triggerWorker, 
                                  arSystemTL, 
@@ -1624,12 +1964,15 @@ int main(int argc, char** argv) {
                                  numCams, 
                                  std::cref(arDevice), 
                                  std::ref(frameQueue),
-                                 std::ref(capStats));
+                                 std::ref(capStats),
+                                 saveQueue.get(),
+                                 &config,
+                                 swapRBMask);
 
         std::thread inferenceThread(inferenceWorker, 
                                   batchSize, 
                                   context, 
-                                  inputName,
+                                  inputName, 
                                   outputName,
                                   inputs, 
                                   outputs, 
@@ -1645,12 +1988,22 @@ int main(int argc, char** argv) {
 #if ENABLE_WEB_SERVER
                                   , config.web_server.enabled ? &webServer : nullptr
 #endif
+                                  , saveQueue.get()
         );
 
         cameraThread.join();
         triggerThread.join();
         inferenceThread.join();
         g_queuePtr = nullptr;
+
+        if (saveQueue) {
+            saveQueue->shutdown();
+        }
+        if (saveThread && saveThread->joinable()) {
+            std::cout << "[INFO] Waiting for Frame Saver thread to drain and finish...\n" << std::flush;
+            saveThread->join();
+        }
+        g_saveQueuePtr = nullptr;
 
 #if ENABLE_WEB_SERVER
         if (config.web_server.enabled) {
@@ -1692,22 +2045,36 @@ int main(int argc, char** argv) {
             double postTrackFps = avgTotalMs > 0.0 ? (1000.0 / avgTotalMs) : 0.0;
             double avgDropFps = rawTrtFps - postTrackFps;
 
+            const bool trackingOn = config.tracking.enabled;
             std::cout << "[INFERENCE SUMMARY]:\n"
                       << "  Total Batches Inferred   : " << infStats.totalFrames << "\n"
                       << "  Total Images Processed   : " << infStats.totalFrames * batchSize << " (Batch Size: " << batchSize << ")\n"
-                      << "  Avg Tracked Targets/Frame: " << std::fixed << std::setprecision(1) << avgTargets << " targets\n"
+                      << "  Tracking Mode            : " << (trackingOn ? "ENABLED (ByteTrack MultiCam)" : "DISABLED (Inference Only, Raw Detections in Mask)") << "\n"
+                      << "  Avg " << (trackingOn ? "Tracked" : "Detected") << " Targets/Frame: " << std::fixed << std::setprecision(1) << avgTargets << " targets\n"
                       << "  Avg Preprocessing Time   : " << avgPreMs << " ms\n"
                       << "  Avg TensorRT GPU Time    : " << avgTrtMs << " ms (hardware execution via cudaEvent)\n"
-                      << "  Avg Post/Tracking Time   : " << avgPostMs << " ms\n"
+                      << "  Avg Post/" << (trackingOn ? "Tracking" : "Processing") << " Time   : " << avgPostMs << " ms\n"
                       << "  Avg Active Frame Work    : " << avgTotalMs << " ms\n"
                       << "  Raw Engine Throughput    : " << rawTrtFps << " FPS (" << rawTrtFps * batchSize << " images/sec)\n"
-                      << "  Post-Track Compute FPS   : " << postTrackFps << " FPS (" << postTrackFps * batchSize << " images/sec)\n"
-                      << "  Tracking & Post FPS Drop : -" << (avgDropFps > 0 ? avgDropFps : 0.0) << " FPS ("
+                      << "  Post-" << (trackingOn ? "Track" : "Process") << " Compute FPS   : " << postTrackFps << " FPS (" << postTrackFps * batchSize << " images/sec)\n"
+                      << "  " << (trackingOn ? "Tracking & Post" : "Post-Processing") << " FPS Drop : -" << (avgDropFps > 0 ? avgDropFps : 0.0) << " FPS ("
                       << (rawTrtFps > 0 ? (avgDropFps / rawTrtFps * 100.0) : 0.0) << " %)\n"
                       << "  Pipeline Delivery Rate   : " << avgInfRate << " FPS (camera synchronized)\n"
-                      << "  Pipeline Ingestion Rate  : " << avgInfRate * batchSize << " images/sec\n";
+                      << "  Pipeline Ingestion Rate  : " << avgInfRate * batchSize << " images/sec\n\n";
         } else {
-            std::cout << "[INFERENCE SUMMARY]: Not enough frames inferred to compute average.\n";
+            std::cout << "[INFERENCE SUMMARY]: Not enough frames inferred to compute average.\n\n";
+        }
+
+        if (config.save_frames.enabled) {
+            double avgSaveMs = saveStats.totalBundlesSaved > 0 
+                ? (saveStats.totalSaveTimeMs / saveStats.totalBundlesSaved) 
+                : 0.0;
+            std::cout << "[FRAME SAVER SUMMARY]:\n"
+                      << "  Total Frame Bundles Saved: " << saveStats.totalBundlesSaved << "\n"
+                      << "  Total Image Files Written: " << saveStats.totalImagesSaved << "\n"
+                      << "  Avg Bundle Write Time    : " << std::fixed << std::setprecision(2) << avgSaveMs << " ms\n"
+                      << "  Dropped Queue Items      : " << (saveQueue ? saveQueue->getDroppedCount() : 0) << "\n"
+                      << "  Target Directory         : " << config.save_frames.directory << "\n";
         }
 
         std::cout << "\n[NETWORK & PACKET INTEGRITY SUMMARY]:\n"
